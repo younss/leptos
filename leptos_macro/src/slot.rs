@@ -65,49 +65,14 @@ impl ToTokens for Model {
             body,
         } = self;
 
-        let (impl_generics, generics, where_clause) =
-            body.generics.split_for_impl();
+        let (_, generics, where_clause) = body.generics.split_for_impl();
 
-        let builder_name = quote::format_ident!("{name}Builder");
         let prop_builder_fields = prop_builder_fields(vis, props);
         let prop_docs = generate_prop_docs(props);
         let builder_name_doc = LitStr::new(
             &format!("Props for the [`{name}`] slot."),
             name.span(),
         );
-
-        let count = props
-            .iter()
-            .filter(
-                |Prop {
-                     prop_opts: PropOpt { attrs, .. },
-                     ..
-                 }| *attrs,
-            )
-            .count();
-
-        let dyn_attrs_props = props
-            .iter()
-            .filter(
-                |Prop {
-                     prop_opts: PropOpt { attrs, .. },
-                     ..
-                 }| *attrs,
-            )
-            .enumerate()
-            .map(|(idx, Prop { name, .. })| {
-                let ident = &name;
-                if idx < count - 1 {
-                    quote! {
-                        self.#ident = v.clone().into();
-                    }
-                } else {
-                    quote! {
-                        self.#ident = v.into();
-                    }
-                }
-            })
-            .collect::<TokenStream>();
 
         let output = quote! {
             #[doc = #builder_name_doc]
@@ -126,7 +91,7 @@ impl ToTokens for Model {
                 }
             }
 
-            impl #impl_generics ::leptos::Props for #name #generics #where_clause {
+            /*impl #impl_generics ::leptos::Props for #name #generics #where_clause {
                 type Builder = #builder_name #generics;
                 fn builder() -> Self::Builder {
                     #name::builder()
@@ -138,7 +103,7 @@ impl ToTokens for Model {
                     #dyn_attrs_props
                     self
                 }
-            }
+            }*/
         };
 
         tokens.append_all(output)
@@ -194,25 +159,27 @@ struct PropOpt {
     pub attrs: bool,
 }
 
-struct TypedBuilderOpts {
+struct TypedBuilderOpts<'a> {
     default: bool,
     default_with_value: Option<syn::Expr>,
     strip_option: bool,
     into: bool,
+    ty: &'a Type,
 }
 
-impl TypedBuilderOpts {
-    pub fn from_opts(opts: &PropOpt, is_ty_option: bool) -> Self {
+impl<'a> TypedBuilderOpts<'a> {
+    pub fn from_opts(opts: &PropOpt, ty: &'a Type) -> Self {
         Self {
             default: opts.optional || opts.optional_no_strip || opts.attrs,
             default_with_value: opts.default.clone(),
-            strip_option: opts.strip_option || opts.optional && is_ty_option,
+            strip_option: opts.strip_option || opts.optional && is_option(ty),
             into: opts.into,
+            ty,
         }
     }
 }
 
-impl ToTokens for TypedBuilderOpts {
+impl ToTokens for TypedBuilderOpts<'_> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let default = if let Some(v) = &self.default_with_value {
             let v = v.to_token_stream().to_string();
@@ -223,14 +190,29 @@ impl ToTokens for TypedBuilderOpts {
             quote! {}
         };
 
-        let strip_option = if self.strip_option {
+        // If self.strip_option && self.into, then the strip_option will be represented as part of the transform closure.
+        let strip_option = if self.strip_option && !self.into {
             quote! { strip_option, }
         } else {
             quote! {}
         };
 
         let into = if self.into {
-            quote! { into, }
+            if !self.strip_option {
+                let ty = &self.ty;
+                quote! {
+                    fn transform<__IntoReactiveValueMarker>(value: impl ::leptos::prelude::IntoReactiveValue<#ty, __IntoReactiveValueMarker>) -> #ty {
+                        value.into_reactive_value()
+                    },
+                }
+            } else {
+                let ty = unwrap_option(self.ty);
+                quote! {
+                    fn transform<__IntoReactiveValueMarker>(value: impl ::leptos::prelude::IntoReactiveValue<#ty, __IntoReactiveValueMarker>) -> Option<#ty> {
+                        Some(value.into_reactive_value())
+                    },
+                }
+            }
         } else {
             quote! {}
         };
@@ -262,8 +244,7 @@ fn prop_builder_fields(vis: &Visibility, props: &[Prop]) -> TokenStream {
                 ty,
             } = prop;
 
-            let builder_attrs =
-                TypedBuilderOpts::from_opts(prop_opts, is_option(ty));
+            let builder_attrs = TypedBuilderOpts::from_opts(prop_opts, ty);
 
             let builder_docs = prop_to_doc(prop, PropDocStyle::Inline);
 

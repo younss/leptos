@@ -1,18 +1,20 @@
 use super::{
-    client_builder::{fragment_to_tokens, TagType},
-    convert_to_snake_case, ident_from_tag_name,
+    component_builder::maybe_optimised_component_children,
+    convert_to_snake_case, full_path_from_tag_name,
 };
+use crate::view::{fragment_to_tokens, utils::filter_prefixed_attrs, TagType};
 use proc_macro2::{Ident, TokenStream, TokenTree};
-use quote::{format_ident, quote};
-use rstml::node::{KeyedAttribute, NodeAttribute, NodeElement};
+use quote::{quote, quote_spanned};
+use rstml::node::{CustomNode, KeyedAttribute, NodeAttribute, NodeElement};
 use std::collections::HashMap;
 use syn::spanned::Spanned;
 
 pub(crate) fn slot_to_tokens(
-    node: &NodeElement,
+    node: &mut NodeElement<impl CustomNode>,
     slot: &KeyedAttribute,
     parent_slots: Option<&mut HashMap<String, Vec<TokenStream>>>,
     global_class: Option<&TokenTree>,
+    disable_inert_html: bool,
 ) {
     let name = slot.key.to_string();
     let name = name.trim();
@@ -22,31 +24,35 @@ pub(crate) fn slot_to_tokens(
         node.name().to_string()
     });
 
-    let component_name = ident_from_tag_name(node.name());
-    let span = node.name().span();
+    let component_path = full_path_from_tag_name(node.name());
 
     let Some(parent_slots) = parent_slots else {
-        proc_macro_error::emit_error!(
-            span,
+        proc_macro_error2::emit_error!(
+            node.name().span(),
             "slots cannot be used inside HTML elements"
         );
         return;
     };
 
-    let attrs = node.attributes().iter().filter_map(|node| {
-        if let NodeAttribute::Attribute(node) = node {
-            if is_slot(node) {
-                None
+    let attrs = node
+        .attributes()
+        .iter()
+        .filter_map(|node| {
+            if let NodeAttribute::Attribute(node) = node {
+                if is_slot(node) {
+                    None
+                } else {
+                    Some(node)
+                }
             } else {
-                Some(node)
+                None
             }
-        } else {
-            None
-        }
-    });
+        })
+        .cloned()
+        .collect::<Vec<_>>();
 
     let props = attrs
-        .clone()
+        .iter()
         .filter(|attr| {
             !attr.key.to_string().starts_with("let:")
                 && !attr.key.to_string().starts_with("clone:")
@@ -63,31 +69,19 @@ pub(crate) fn slot_to_tokens(
                 .unwrap_or_else(|| quote! { #name });
 
             quote! {
-                .#name(#[allow(unused_braces)] {#value})
+                .#name(#[allow(unused_braces)] { #value })
             }
         });
 
-    let items_to_bind = attrs
-        .clone()
-        .filter_map(|attr| {
-            attr.key
-                .to_string()
-                .strip_prefix("let:")
-                .map(|ident| format_ident!("{ident}", span = attr.key.span()))
-        })
+    let items_to_bind = filter_prefixed_attrs(attrs.iter(), "let:")
+        .into_iter()
+        .map(|ident| quote! { #ident })
         .collect::<Vec<_>>();
 
-    let items_to_clone = attrs
-        .clone()
-        .filter_map(|attr| {
-            attr.key
-                .to_string()
-                .strip_prefix("clone:")
-                .map(|ident| format_ident!("{ident}", span = attr.key.span()))
-        })
-        .collect::<Vec<_>>();
+    let items_to_clone = filter_prefixed_attrs(attrs.iter(), "clone:");
 
     let dyn_attrs = attrs
+        .iter()
         .filter(|attr| attr.key.to_string().starts_with("attr:"))
         .filter_map(|attr| {
             let name = &attr.key.to_string();
@@ -95,7 +89,7 @@ pub(crate) fn slot_to_tokens(
             let value = attr.value().map(|v| {
                 quote! { #v }
             })?;
-            Some(quote! { (#name, ::leptos::IntoAttribute::into_attribute(#value)) })
+            Some(quote! { (#name, #value) })
         })
         .collect::<Vec<_>>();
 
@@ -108,36 +102,49 @@ pub(crate) fn slot_to_tokens(
     let mut slots = HashMap::new();
     let children = if node.children.is_empty() {
         quote! {}
+    } else if let Some(children) = maybe_optimised_component_children(
+        &node.children,
+        &items_to_bind,
+        &items_to_clone,
+    ) {
+        children
     } else {
-        cfg_if::cfg_if! {
-            if #[cfg(debug_assertions)] {
-                let marker = format!("<{component_name}/>-children");
-                let view_marker = quote! { .with_view_marker(#marker) };
-            } else {
-                let view_marker = quote! {};
-            }
-        }
-
         let children = fragment_to_tokens(
-            span,
-            &node.children,
-            true,
+            &mut node.children,
             TagType::Unknown,
             Some(&mut slots),
             global_class,
             None,
+            disable_inert_html,
         );
+
+        // TODO view markers for hot-reloading
+        /*
+         cfg_if::cfg_if! {
+            if #[cfg(debug_assertions)] {
+                let marker = format!("<{component_name}/>-children");
+                // For some reason spanning for `.children` breaks, unless `#view_marker`
+                // is also covered by `children.span()`.
+                let view_marker = quote_spanned!(children.span()=> .with_view_marker(#marker));
+            } else {
+                let view_marker = quote! {};
+            }
+        }
+        */
+        let view_marker = quote! {};
 
         if let Some(children) = children {
             let bindables =
                 items_to_bind.iter().map(|ident| quote! { #ident, });
 
-            let clonables = items_to_clone
-                .iter()
-                .map(|ident| quote! { let #ident = #ident.clone(); });
+            let clonables = items_to_clone.iter().map(|ident| {
+                quote_spanned! {ident.span()=>
+                    let #ident = ::core::clone::Clone::clone(&#ident);
+                }
+            });
 
             if bindables.len() > 0 {
-                quote! {
+                quote_spanned! {children.span()=>
                     .children({
                         #(#clonables)*
 
@@ -145,11 +152,11 @@ pub(crate) fn slot_to_tokens(
                     })
                 }
             } else {
-                quote! {
+                quote_spanned! {children.span()=>
                     .children({
                         #(#clonables)*
 
-                        ::leptos::ToChildren::to_children(move || #children #view_marker)
+                        ::leptos::children::ToChildren::to_children(move || #children #view_marker)
                     })
                 }
             }
@@ -158,29 +165,45 @@ pub(crate) fn slot_to_tokens(
         }
     };
 
-    let slots = slots.drain().map(|(slot, values)| {
+    let slots = slots.drain().map(|(slot, mut values)| {
+        let span = values
+            .last()
+            .expect("List of slots must not be empty")
+            .span();
         let slot = Ident::new(&slot, span);
-        if values.len() > 1 {
+        let value = if values.len() > 1 {
             quote! {
-                .#slot(::std::vec![
+                ::std::vec![
                     #(#values)*
-                ])
+                ]
             }
         } else {
-            let value = &values[0];
-            quote! { .#slot(#value) }
-        }
+            values.remove(0)
+        };
+
+        quote! { .#slot(#value) }
     });
 
-    let slot = quote! {
-        #component_name::builder()
-            #(#props)*
-            #(#slots)*
-            #children
-            .build()
-            #dyn_attrs
-            .into(),
+    let build = quote_spanned! {node.name().span()=>
+        .build()
     };
+
+    let slot = quote_spanned! {node.span()=>
+        {
+            let slot = #component_path::builder()
+                #(#props)*
+                #(#slots)*
+                #children
+                #build
+                #dyn_attrs;
+
+            #[allow(unreachable_code, clippy::useless_conversion)]
+            slot.into()
+        },
+    };
+
+    // We need to move "allow" out of "quote_spanned" because it breaks hovering in rust-analyzer
+    let slot = quote!(#[allow(unused_braces)] #slot);
 
     parent_slots
         .entry(name)
@@ -194,7 +217,9 @@ pub(crate) fn is_slot(node: &KeyedAttribute) -> bool {
     key == "slot" || key.starts_with("slot:")
 }
 
-pub(crate) fn get_slot(node: &NodeElement) -> Option<&KeyedAttribute> {
+pub(crate) fn get_slot(
+    node: &NodeElement<impl CustomNode>,
+) -> Option<&KeyedAttribute> {
     node.attributes().iter().find_map(|node| {
         if let NodeAttribute::Attribute(node) = node {
             if is_slot(node) {

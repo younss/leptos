@@ -1,25 +1,19 @@
-// Implementation based on Solid Router
-// see <https://github.com/solidjs/solid-router/blob/main/src/utils.ts>
-
 use std::borrow::Cow;
 
-#[doc(hidden)]
 pub fn resolve_path<'a>(
     base: &'a str,
     path: &'a str,
     from: Option<&'a str>,
-) -> Option<Cow<'a, str>> {
+) -> Cow<'a, str> {
     if has_scheme(path) {
-        Some(path.into())
+        path.into()
     } else {
         let base_path = normalize(base, false);
         let from_path = from.map(|from| normalize(from, false));
         let result = if let Some(from_path) = from_path {
             if path.starts_with('/') {
                 base_path
-            } else if from_path.to_lowercase().find(&base_path.to_lowercase())
-                != Some(0)
-            {
+            } else if from_path.find(base_path.as_ref()) != Some(0) {
                 base_path + from_path
             } else {
                 from_path
@@ -31,7 +25,7 @@ pub fn resolve_path<'a>(
         let result_empty = result.is_empty();
         let prefix = if result_empty { "/".into() } else { result };
 
-        Some(prefix + normalize(path, result_empty))
+        prefix + normalize(path, result_empty)
     }
 }
 
@@ -66,14 +60,15 @@ fn normalize(path: &str, omit_slash: bool) -> Cow<'_, str> {
     }
 }
 
+fn begins_with_query_or_hash(text: &str) -> bool {
+    matches!(text.chars().next(), Some('#') | Some('?'))
+}
+
+/* TODO can remove?
 #[doc(hidden)]
 pub fn join_paths<'a>(from: &'a str, to: &'a str) -> String {
     let from = remove_wildcard(&normalize(from, false));
     from + normalize(to, false).as_ref()
-}
-
-fn begins_with_query_or_hash(text: &str) -> bool {
-    matches!(text.chars().next(), Some('#') | Some('?'))
 }
 
 fn remove_wildcard(text: &str) -> String {
@@ -83,6 +78,7 @@ fn remove_wildcard(text: &str) -> String {
         .trim_end_matches('/')
         .to_string()
 }
+*/
 
 #[cfg(test)]
 mod tests {

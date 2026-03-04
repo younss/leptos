@@ -8,13 +8,11 @@ codegen-units = 1
 lto = true
 
 [dependencies]
-leptos = { path = "../../leptos", features = ["csr", "nightly"] }
-leptos_router = { path = "../../router", features = ["csr"] }
-console_log = "1"
-log = "0.4"
+leptos = { path = "../../leptos", features = ["csr"] }
+leptos_router = { path = "../../router", features = [] }
 console_error_panic_hook = "0.1.7"
 
 [dev-dependencies]
-wasm-bindgen = "0.2"
-wasm-bindgen-test = "0.3.0"
-web-sys = "0.3"
+wasm-bindgen = "0.2.93"
+wasm-bindgen-test = "0.3.42"
+web-sys = "0.3.70"

@@ -1,5 +1,5 @@
 use crate::errors::TodoAppError;
-use leptos::{Errors, *};
+use leptos::prelude::*;
 #[cfg(feature = "ssr")]
 use leptos_axum::ResponseOptions;
 
@@ -11,7 +11,7 @@ pub fn ErrorTemplate(
     #[prop(optional)] errors: Option<RwSignal<Errors>>,
 ) -> impl IntoView {
     let errors = match outside_errors {
-        Some(e) => create_rw_signal(e),
+        Some(e) => RwSignal::new(e),
         None => match errors {
             Some(e) => e,
             None => panic!("No Errors found and we expected errors!"),
@@ -37,21 +37,21 @@ pub fn ErrorTemplate(
     }
 
     view! {
-      <h1>"Errors"</h1>
-      <For
-        // a function that returns the items we're iterating over; a signal is fine
-        each= move || {errors.clone().into_iter().enumerate()}
-        // a unique key for each item as a reference
-        key=|(index, _error)| *index
-        // renders each item to a view
-        children=move |error| {
-        let error_string = error.1.to_string();
-        let error_code= error.1.status_code();
-          view! {
-            <h2>{error_code.to_string()}</h2>
-            <p>"Error: " {error_string}</p>
-          }
-        }
-      />
+        <h1>"Errors"</h1>
+        <For
+            // a function that returns the items we're iterating over; a signal is fine
+            each=move || { errors.clone().into_iter().enumerate() }
+            // a unique key for each item as a reference
+            key=|(index, _error)| *index
+            // renders each item to a view
+            children=move |error| {
+                let error_string = error.1.to_string();
+                let error_code = error.1.status_code();
+                view! {
+                    <h2>{error_code.to_string()}</h2>
+                    <p>"Error: " {error_string}</p>
+                }
+            }
+        />
     }
 }

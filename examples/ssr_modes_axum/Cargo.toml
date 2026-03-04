@@ -7,24 +7,29 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-console_error_panic_hook = "0.1"
-console_log = "1"
-lazy_static = "1"
-leptos = { path = "../../leptos", features = ["nightly"] }
-leptos_meta = { path = "../../meta", features = ["nightly"] }
+console_error_panic_hook = "0.1.7"
+console_log = "1.0"
+leptos = { path = "../../leptos", features = [
+  "hydration",
+] } #"nightly", "hydration"] }
+leptos_meta = { path = "../../meta" }
 leptos_axum = { path = "../../integrations/axum", optional = true }
-leptos_router = { path = "../../router", features = ["nightly"] }
-log = "0.4"
-serde = { version = "1", features = ["derive"] }
-thiserror = "1"
-axum = { version = "0.7", optional = true }
-tower = { version = "0.4", optional = true }
-tower-http = { version = "0.5", features = ["fs"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"], optional = true }
-wasm-bindgen = "0.2"
+leptos_router = { path = "../../router" }
+log = "0.4.22"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0.12"
+axum = { version = "0.8.1", optional = true }
+tower = { version = "0.4.13", optional = true }
+tower-http = { version = "0.5.2", features = ["fs"], optional = true }
+tokio = { version = "1.39", features = [
+  "rt-multi-thread",
+  "macros",
+  "time",
+], optional = true }
+wasm-bindgen = "0.2.93"
 
 [features]
-hydrate = ["leptos/hydrate", "leptos_meta/hydrate", "leptos_router/hydrate"]
+hydrate = ["leptos/hydrate"]
 ssr = [
   "dep:axum",
   "dep:tower",
@@ -32,13 +37,23 @@ ssr = [
   "dep:tokio",
   "leptos/ssr",
   "leptos_meta/ssr",
-  "leptos_router/ssr",
   "dep:leptos_axum",
+  "leptos_router/ssr",
 ]
+
+[profile.release]
+panic = "abort"
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = 'z'
+lto = true
+codegen-units = 1
+panic = "abort"
 
 [package.metadata.cargo-all-features]
 denylist = ["axum", "tower", "tower-http", "tokio", "sqlx", "leptos_axum"]
-skip_feature_sets = [["ssr", "hydrate"]]
+skip_feature_sets = [["ssr", "hydrate"], []]
 
 [package.metadata.leptos]
 # The name used by wasm-bindgen/cargo-leptos for the JS/WASM bundle. Defaults to the crate name
@@ -56,7 +71,7 @@ style-file = "style/main.scss"
 # Optional. Env: LEPTOS_ASSETS_DIR.
 assets-dir = "assets"
 # The IP and port (ex: 127.0.0.1:3000) where the server serves the content. Use it in your server setup.
-site-addr = "127.0.0.1:3000"
+site-addr = "127.0.0.1:3007"
 # The port to use for automatic reload monitoring
 reload-port = 3001
 # [Optional] Command to use when running end2end tests. It will run in the end2end dir.
@@ -89,3 +104,5 @@ lib-features = ["hydrate"]
 #
 # Optional. Defaults to false.
 lib-default-features = false
+
+lib-profile-release = "wasm-release"

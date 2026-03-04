@@ -3,21 +3,27 @@ use convert_case::{
     Case::{Pascal, Snake},
     Casing,
 };
+use convert_case_extras::is_case;
 use itertools::Itertools;
 use leptos_hot_reload::parsing::value_to_string;
 use proc_macro2::{Ident, Span, TokenStream};
+use proc_macro_error2::abort;
 use quote::{format_ident, quote, quote_spanned, ToTokens, TokenStreamExt};
+use std::hash::DefaultHasher;
 use syn::{
-    parse::Parse, parse_quote, spanned::Spanned,
-    AngleBracketedGenericArguments, Attribute, FnArg, GenericArgument, Item,
-    ItemFn, LitStr, Meta, Pat, PatIdent, Path, PathArguments, ReturnType,
-    Signature, Stmt, Type, TypePath, Visibility,
+    parse::Parse, parse_quote, spanned::Spanned, token::Colon,
+    visit_mut::VisitMut, AngleBracketedGenericArguments, Attribute, FnArg,
+    GenericArgument, GenericParam, Item, ItemFn, LitStr, Meta, Pat, PatIdent,
+    Path, PathArguments, ReturnType, Signature, Stmt, Type, TypeImplTrait,
+    TypeParam, TypePath, Visibility,
 };
 
 pub struct Model {
     is_transparent: bool,
-    is_island: bool,
+    is_lazy: bool,
+    island: Option<String>,
     docs: Docs,
+    unknown_attrs: UnknownAttrs,
     vis: Visibility,
     name: Ident,
     props: Vec<Prop>,
@@ -28,8 +34,12 @@ pub struct Model {
 impl Parse for Model {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let mut item = ItemFn::parse(input)?;
+        maybe_modify_return_type(&mut item.sig.output);
+
+        convert_impl_trait_to_generic(&mut item.sig);
 
         let docs = Docs::new(&item.attrs);
+        let unknown_attrs = UnknownAttrs::new(&item.attrs);
 
         let props = item
             .sig
@@ -56,25 +66,51 @@ impl Parse for Model {
             }
         });
 
-        // Make sure return type is correct
-        if !is_valid_into_view_return_type(&item.sig.output) {
-            abort!(
-                item.sig,
-                "return type is incorrect";
-                help = "return signature must be `-> impl IntoView`"
-            );
-        }
-
         Ok(Self {
             is_transparent: false,
-            is_island: false,
+            is_lazy: false,
+            island: None,
             docs,
+            unknown_attrs,
             vis: item.vis.clone(),
             name: convert_from_snake_case(&item.sig.ident),
             props,
             ret: item.sig.output.clone(),
             body: item,
         })
+    }
+}
+
+/// Exists to fix nested routes defined in a separate component in erased mode,
+/// by replacing the return type with AnyNestedRoute, which is what it'll be, but is required as the return type for compiler inference.
+fn maybe_modify_return_type(ret: &mut ReturnType) {
+    #[cfg(feature = "__internal_erase_components")]
+    {
+        if let ReturnType::Type(_, ty) = ret {
+            if let Type::ImplTrait(TypeImplTrait { bounds, .. }) = ty.as_ref() {
+                // If one of the bounds is MatchNestedRoutes, we need to replace the return type with AnyNestedRoute:
+                if bounds.iter().any(|bound| {
+                    if let syn::TypeParamBound::Trait(trait_bound) = bound {
+                        if trait_bound.path.segments.iter().any(
+                            |path_segment| {
+                                path_segment.ident == "MatchNestedRoutes"
+                            },
+                        ) {
+                            return true;
+                        }
+                    }
+                    false
+                }) {
+                    *ty = parse_quote!(
+                        ::leptos_router::any_nested_route::AnyNestedRoute
+                    );
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "__internal_erase_components"))]
+    {
+        let _ = ret;
     }
 }
 
@@ -96,7 +132,7 @@ pub fn drain_filter<T>(
 
 pub fn convert_from_snake_case(name: &Ident) -> Ident {
     let name_str = name.to_string();
-    if !name_str.is_case(Snake) {
+    if !is_case(&name_str, Snake) {
         name.clone()
     } else {
         Ident::new(&name_str.to_case(Pascal), name.span())
@@ -107,14 +143,17 @@ impl ToTokens for Model {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let Self {
             is_transparent,
-            is_island,
+            is_lazy,
+            island,
             docs,
+            unknown_attrs,
             vis,
             name,
             props,
             body,
             ret,
         } = self;
+        let is_island = island.is_some();
 
         let no_props = props.is_empty();
 
@@ -126,7 +165,7 @@ impl ToTokens for Model {
                     _ => None,
                 });
             if let Some(semi) = ends_semi {
-                proc_macro_error::emit_error!(
+                proc_macro_error2::emit_error!(
                     semi.span(),
                     "A component that ends with a `view!` macro followed by a \
                      semicolon will return (), an empty view. This is usually \
@@ -137,22 +176,22 @@ impl ToTokens for Model {
             }
         }
 
+        //body.sig.ident = format_ident!("__{}", body.sig.ident);
         #[allow(clippy::redundant_clone)] // false positive
         let body_name = body.sig.ident.clone();
 
         let (impl_generics, generics, where_clause) =
             body.sig.generics.split_for_impl();
 
-        let lifetimes = body.sig.generics.lifetimes();
-
         let props_name = format_ident!("{name}Props");
         let props_builder_name = format_ident!("{name}PropsBuilder");
         let props_serialized_name = format_ident!("{name}PropsSerialized");
+        #[cfg(feature = "tracing")]
         let trace_name = format!("<{name} />");
 
-        let is_island_with_children = *is_island
-            && props.iter().any(|prop| prop.name.ident == "children");
-        let is_island_with_other_props = *is_island
+        let is_island_with_children =
+            is_island && props.iter().any(|prop| prop.name.ident == "children");
+        let is_island_with_other_props = is_island
             && ((is_island_with_children && props.len() > 1)
                 || (!is_island_with_children && !props.is_empty()));
 
@@ -178,43 +217,89 @@ impl ToTokens for Model {
         );
 
         let component_fn_prop_docs = generate_component_fn_prop_docs(props);
+        let docs_and_prop_docs = if component_fn_prop_docs.is_empty() {
+            // Avoid generating an empty doc line in case the component has no doc and no props.
+            quote! {
+                #docs
+            }
+        } else {
+            quote! {
+                #docs
+                #[doc = ""]
+                #component_fn_prop_docs
+            }
+        };
 
         let (
             tracing_instrument_attr,
             tracing_span_expr,
             tracing_guard_expr,
             tracing_props_expr,
-        ) = if cfg!(feature = "tracing") {
-            (
-                quote! {
-                    #[allow(clippy::let_with_type_underscore)]
+        ) = {
+            #[cfg(feature = "tracing")]
+            {
+                /* TODO for 0.8: fix this
+                 *
+                 * The problem is that cargo now warns about an expected "tracing" cfg if
+                 * you don't have a "tracing" feature in your actual crate
+                 *
+                 * However, until https://github.com/tokio-rs/tracing/pull/1819 is merged
+                 * (?), you can't provide an alternate path for `tracing` (for example,
+                 * ::leptos::tracing), which means that if you're going to use the macro
+                 * you *must* have `tracing` in your Cargo.toml.
+                 *
+                 * Including the feature-check here causes cargo warnings on
+                 * previously-working projects.
+                 *
+                 * Removing the feature-check here breaks any project that uses leptos with
+                 * the tracing feature turned on, but without a tracing dependency in its
+                 * Cargo.toml.
+                 * /
+                 */
+                let instrument = cfg!(feature = "trace-components").then(|| quote! {
                     #[cfg_attr(
-                        any(debug_assertions, feature="ssr"),
-                        ::leptos::leptos_dom::tracing::instrument(level = "trace", name = #trace_name, skip_all)
+                        feature = "tracing",
+                        ::leptos::tracing::instrument(level = "info", name = #trace_name, skip_all)
                     )]
-                },
-                quote! {
-                    let span = ::leptos::leptos_dom::tracing::Span::current();
-                },
-                quote! {
-                    #[cfg(debug_assertions)]
-                    let _guard = span.entered();
-                },
-                if no_props || !cfg!(feature = "trace-component-props") {
-                    quote! {}
-                } else {
+                });
+
+                (
                     quote! {
-                        ::leptos::leptos_dom::tracing_props![#prop_names];
-                    }
-                },
-            )
-        } else {
-            (quote! {}, quote! {}, quote! {}, quote! {})
+                        #[allow(clippy::let_with_type_underscore)]
+                        #instrument
+                    },
+                    quote! {
+                        let __span = ::leptos::tracing::Span::current();
+                    },
+                    quote! {
+                        #[cfg(debug_assertions)]
+                        let _guard = __span.entered();
+                    },
+                    if no_props || !cfg!(feature = "trace-component-props") {
+                        quote!()
+                    } else {
+                        quote! {
+                            ::leptos::leptos_dom::tracing_props![#prop_names];
+                        }
+                    },
+                )
+            }
+
+            #[cfg(not(feature = "tracing"))]
+            {
+                (quote!(), quote!(), quote!(), quote!())
+            }
         };
 
         let component_id = name.to_string();
-        let hydrate_fn_name =
-            Ident::new(&format!("_island_{}", component_id), name.span());
+        let hydrate_fn_name = is_island.then(|| {
+            use std::hash::{Hash, Hasher};
+
+            let mut hasher = DefaultHasher::new();
+            island.hash(&mut hasher);
+            let caller = hasher.finish() as usize;
+            Ident::new(&format!("{component_id}_{caller:?}"), name.span())
+        });
 
         let island_serialize_props = if is_island_with_other_props {
             quote! {
@@ -225,17 +310,21 @@ impl ToTokens for Model {
         };
         let island_serialized_props = if is_island_with_other_props {
             quote! {
-                .attr("data-props", _leptos_ser_props)
+                .with_props( _leptos_ser_props)
             }
         } else {
             quote! {}
         };
 
         let body_name = unmodified_fn_name_from_fn_name(&body_name);
-        let body_expr = if *is_island {
+        let body_expr = if is_island {
             quote! {
-                ::leptos::SharedContext::with_hydration(move || {
-                    #body_name(#prop_names)
+                ::leptos::reactive::owner::Owner::new().with(|| {
+                    ::leptos::reactive::owner::Owner::with_hydration(move || {
+                        ::leptos::tachys::reactive_graph::OwnedView::new({
+                            #body_name(#prop_names)
+                        })
+                    })
                 })
             }
         } else {
@@ -246,10 +335,21 @@ impl ToTokens for Model {
 
         let component = if *is_transparent {
             body_expr
+        } else if cfg!(feature = "__internal_erase_components") {
+            quote! {
+                ::leptos::prelude::IntoMaybeErased::into_maybe_erased(
+                    ::leptos::reactive::graph::untrack_with_diagnostics(
+                        move || {
+                            #tracing_guard_expr
+                            #tracing_props_expr
+                            #body_expr
+                        }
+                    )
+                )
+            }
         } else {
             quote! {
-                ::leptos::leptos_dom::Component::new(
-                    ::std::stringify!(#name),
+                ::leptos::reactive::graph::untrack_with_diagnostics(
                     move || {
                         #tracing_guard_expr
                         #tracing_props_expr
@@ -260,17 +360,14 @@ impl ToTokens for Model {
         };
 
         // add island wrapper if island
-        let component = if *is_island {
+        let component = if is_island {
+            let hydrate_fn_name = hydrate_fn_name.as_ref().unwrap();
             quote! {
-                {
-                    ::leptos::leptos_dom::html::custom(
-                        ::leptos::leptos_dom::html::Custom::new("leptos-island"),
-                    )
-                    .attr("data-component", #component_id)
-                    .attr("data-hkc", ::leptos::leptos_dom::HydrationCtx::peek_always().to_string())
-                    #island_serialized_props
-                    .child(#component)
-                }
+                ::leptos::tachys::html::islands::Island::new(
+                    stringify!(#hydrate_fn_name),
+                    #component
+                )
+                #island_serialized_props
             }
         } else {
             component
@@ -287,20 +384,32 @@ impl ToTokens for Model {
         let destructure_props = if no_props {
             quote! {}
         } else {
-            let wrapped_children = if is_island_with_children
-                && cfg!(feature = "ssr")
-            {
+            let wrapped_children = if is_island_with_children {
                 quote! {
-                    let children = ::std::boxed::Box::new(|| ::leptos::Fragment::lazy(|| ::std::vec![
-                        ::leptos::SharedContext::with_hydration(move || {
-                            ::leptos::IntoView::into_view(
-                                ::leptos::leptos_dom::html::custom(
-                                    ::leptos::leptos_dom::html::Custom::new("leptos-children"),
-                                )
-                                .child(::leptos::SharedContext::no_hydration(children))
-                            )
-                        })
-                    ]));
+                    use leptos::tachys::view::any_view::IntoAny;
+                    let children = Box::new(|| {
+                        let sc = ::leptos::reactive::owner::Owner::current_shared_context().unwrap();
+                        let prev = sc.get_is_hydrating();
+                        let owner = ::leptos::reactive::owner::Owner::new();
+                        let value = owner.clone().with(|| {
+                            ::leptos::reactive::owner::Owner::with_no_hydration(move || {
+                                ::leptos::tachys::reactive_graph::OwnedView::new({
+                                    ::leptos::tachys::html::islands::IslandChildren::new_with_on_hydrate(
+                                        children(),
+                                        {
+                                            let owner = owner.clone();
+                                            move || {
+                                                owner.set()
+                                            }
+                                        }
+
+                                    )
+                                }).into_any()
+                            })
+                        });
+                        sc.set_is_hydrating(prev);
+                        value
+                    });
                 }
             } else {
                 quote! {}
@@ -314,113 +423,87 @@ impl ToTokens for Model {
             }
         };
 
-        let into_view = if no_props {
-            quote! {
-                impl #impl_generics ::leptos::IntoView for #props_name #generics #where_clause {
-                    fn into_view(self) -> ::leptos::View {
-                        #name().into_view()
-                    }
-                }
-            }
-        } else {
-            quote! {
-                impl #impl_generics ::leptos::IntoView for #props_name #generics #where_clause {
-                    fn into_view(self) -> ::leptos::View {
-                        #name(self).into_view()
-                    }
-                }
-            }
-        };
-
-        let count = props
-            .iter()
-            .filter(
-                |Prop {
-                     prop_opts: PropOpt { attrs, .. },
-                     ..
-                 }| *attrs,
-            )
-            .count();
-
-        let dyn_attrs_props = props
-            .iter()
-            .filter(
-                |Prop {
-                     prop_opts: PropOpt { attrs, .. },
-                     ..
-                 }| *attrs,
-            )
-            .enumerate()
-            .map(|(idx, Prop { name, .. })| {
-                let ident = &name.ident;
-                if idx < count - 1 {
-                    quote! {
-                        self.#ident = v.clone().into();
-                    }
-                } else {
-                    quote! {
-                        self.#ident = v.into();
-                    }
-                }
-            })
-            .collect::<TokenStream>();
-
         let body = quote! {
             #destructure_props
             #tracing_span_expr
             #component
         };
 
-        let binding = if *is_island && cfg!(feature = "hydrate") {
+        let binding = if is_island {
             let island_props = if is_island_with_children
                 || is_island_with_other_props
             {
-                let (destructure, prop_builders) = if is_island_with_other_props
-                {
-                    let prop_names = props
-                        .iter()
-                        .filter_map(|prop| {
-                            if prop.name.ident == "children" {
-                                None
-                            } else {
-                                let name = &prop.name.ident;
-                                Some(quote! { #name, })
-                            }
-                        })
-                        .collect::<TokenStream>();
-                    let destructure = quote! {
-                        let #props_serialized_name {
-                            #prop_names
-                        } = props;
+                let (destructure, prop_builders, optional_props) =
+                    if is_island_with_other_props {
+                        let prop_names = props
+                            .iter()
+                            .filter_map(|prop| {
+                                if prop.name.ident == "children" {
+                                    None
+                                } else {
+                                    let name = &prop.name.ident;
+                                    Some(quote! { #name, })
+                                }
+                            })
+                            .collect::<TokenStream>();
+                        let destructure = quote! {
+                            let #props_serialized_name {
+                                #prop_names
+                            } = props;
+                        };
+                        let prop_builders = props
+                            .iter()
+                            .filter_map(|prop| {
+                                if prop.name.ident == "children"
+                                    || prop.prop_opts.optional
+                                {
+                                    None
+                                } else {
+                                    let name = &prop.name.ident;
+                                    Some(quote! {
+                                        .#name(#name)
+                                    })
+                                }
+                            })
+                            .collect::<TokenStream>();
+                        let optional_props = props
+                            .iter()
+                            .filter_map(|prop| {
+                                if prop.name.ident == "children"
+                                    || !prop.prop_opts.optional
+                                {
+                                    None
+                                } else {
+                                    let name = &prop.name.ident;
+                                    Some(quote! {
+                                        if let Some(#name) = #name {
+                                            props.#name = Some(#name)
+                                        }
+                                    })
+                                }
+                            })
+                            .collect::<TokenStream>();
+                        (destructure, prop_builders, optional_props)
+                    } else {
+                        (quote! {}, quote! {}, quote! {})
                     };
-                    let prop_builders = props
-                        .iter()
-                        .filter_map(|prop| {
-                            if prop.name.ident == "children" {
-                                None
-                            } else {
-                                let name = &prop.name.ident;
-                                Some(quote! {
-                                    .#name(#name)
-                                })
-                            }
-                        })
-                        .collect::<TokenStream>();
-                    (destructure, prop_builders)
-                } else {
-                    (quote! {}, quote! {})
-                };
                 let children = if is_island_with_children {
                     quote! {
-                        .children(::std::boxed::Box::new(move || ::leptos::Fragment::lazy(|| ::std::vec![
-                            ::leptos::SharedContext::with_hydration(move || {
-                                ::leptos::IntoView::into_view(
-                                    ::leptos::leptos_dom::html::custom(
-                                        ::leptos::leptos_dom::html::Custom::new("leptos-children"),
-                                    )
-                                    .prop("$$owner", ::leptos::Owner::current().map(|n| n.as_ffi()))
-                                )
-                        })])))
+                        .children({
+                            let owner = leptos::reactive::owner::Owner::current();
+                            Box::new(move || {
+                            use leptos::tachys::view::any_view::IntoAny;
+                            ::leptos::tachys::html::islands::IslandChildren::new_with_on_hydrate(
+                                (),
+                                {
+                                    let owner = owner.clone();
+                                    move || {
+                                        if let Some(owner) = &owner {
+                                            owner.set()
+                                        }
+                                    }
+                                }
+                            ).into_any()})})
                     }
                 } else {
                     quote! {}
@@ -428,10 +511,14 @@ impl ToTokens for Model {
 
                 quote! {{
                     #destructure
-                    #props_name::builder()
+                    let mut props = #props_name::builder()
                         #prop_builders
                         #children
-                        .build()
+                        .build();
+
+                    #optional_props
+
+                    props
                 }}
             } else {
                 quote! {}
@@ -446,20 +533,42 @@ impl ToTokens for Model {
                 quote! {}
             };
 
-            quote! {
-                #[::leptos::wasm_bindgen::prelude::wasm_bindgen(wasm_bindgen = ::leptos::wasm_bindgen)]
-                #[allow(non_snake_case)]
-                pub fn #hydrate_fn_name(el: ::leptos::web_sys::HtmlElement) {
-                    if let Some(Ok(key)) = el.dataset().get(::leptos::wasm_bindgen::intern("hkc")).map(|key| std::str::FromStr::from_str(&key)) {
-                        ::leptos::leptos_dom::HydrationCtx::continue_from(key);
+            let hydrate_fn_name = hydrate_fn_name.as_ref().unwrap();
+
+            let hydrate_fn_inner = quote! {
+                #deserialize_island_props
+                let island = #name(#island_props);
+                let state = island.hydrate_from_position::<true>(&el, ::leptos::tachys::view::Position::Current);
+                // TODO better cleanup
+                std::mem::forget(state);
+            };
+            if *is_lazy {
+                let outer_name =
+                    Ident::new(&format!("{name}_loader"), name.span());
+
+                quote! {
+                    #[::leptos::prelude::lazy]
+                    #[allow(non_snake_case)]
+                    fn #outer_name (el: ::leptos::web_sys::HtmlElement) {
+                        #hydrate_fn_inner
                     }
-                    #deserialize_island_props
-                    _ = ::leptos::run_as_child(move || {
-                        ::leptos::SharedContext::register_island(&el);
-                        ::leptos::leptos_dom::mount_to_with_stop_hydrating(el, false, move || {
-                            #name(#island_props)
-                        })
-                    });
+
+                    #[::leptos::wasm_bindgen::prelude::wasm_bindgen(
+                        wasm_bindgen = ::leptos::wasm_bindgen,
+                        wasm_bindgen_futures = ::leptos::__reexports::wasm_bindgen_futures
+                    )]
+                    #[allow(non_snake_case)]
+                    pub async fn #hydrate_fn_name(el: ::leptos::web_sys::HtmlElement) {
+                        #outer_name(el).await
+                    }
+                }
+            } else {
+                quote! {
+                    #[::leptos::wasm_bindgen::prelude::wasm_bindgen(wasm_bindgen = ::leptos::wasm_bindgen)]
+                    #[allow(non_snake_case)]
+                    pub fn #hydrate_fn_name(el: ::leptos::web_sys::HtmlElement) {
+                        #hydrate_fn_inner
+                    }
                 }
             }
         } else {
@@ -475,12 +584,11 @@ impl ToTokens for Model {
         let output = quote! {
             #[doc = #builder_name_doc]
             #[doc = ""]
-            #docs
-            #[doc = ""]
-            #component_fn_prop_docs
+            #docs_and_prop_docs
             #[derive(::leptos::typed_builder_macro::TypedBuilder #props_derive_serialize)]
             //#[builder(doc)]
             #[builder(crate_module_path=::leptos::typed_builder)]
+            #[allow(non_snake_case)]
             #vis struct #props_name #impl_generics #where_clause {
                 #prop_builder_fields
             }
@@ -490,31 +598,30 @@ impl ToTokens for Model {
             #[allow(missing_docs)]
             #binding
 
-            impl #impl_generics ::leptos::Props for #props_name #generics #where_clause {
+            impl #impl_generics ::leptos::component::Props for #props_name #generics #where_clause {
                 type Builder = #props_builder_name #generics;
+
                 fn builder() -> Self::Builder {
                     #props_name::builder()
                 }
             }
 
-            impl #impl_generics ::leptos::DynAttrs for #props_name #generics #where_clause {
+            // TODO restore dyn attrs
+            /*impl #impl_generics ::leptos::DynAttrs for #props_name #generics #where_clause {
                 fn dyn_attrs(mut self, v: Vec<(&'static str, ::leptos::Attribute)>) -> Self {
                     #dyn_attrs_props
                     self
                 }
-            }
+            } */
 
-            #into_view
-
-            #docs
-            #[doc = ""]
-            #component_fn_prop_docs
+            #unknown_attrs
+            #docs_and_prop_docs
             #[allow(non_snake_case, clippy::too_many_arguments)]
             #[allow(clippy::needless_lifetimes)]
             #tracing_instrument_attr
             #vis fn #name #impl_generics (
                 #props_arg
-            ) #ret #(+ #lifetimes)*
+            ) #ret
             #where_clause
             {
                 #body
@@ -534,8 +641,15 @@ impl Model {
     }
 
     #[allow(clippy::wrong_self_convention)]
-    pub fn is_island(mut self) -> Self {
-        self.is_island = true;
+    pub fn is_lazy(mut self, is_lazy: bool) -> Self {
+        self.is_lazy = is_lazy;
+
+        self
+    }
+
+    #[allow(clippy::wrong_self_convention)]
+    pub fn with_island(mut self, island: Option<String>) -> Self {
+        self.island = island;
 
         self
     }
@@ -554,9 +668,15 @@ pub struct DummyModel {
 
 impl Parse for DummyModel {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let attrs = input.call(Attribute::parse_outer)?;
+        let mut attrs = input.call(Attribute::parse_outer)?;
+        // Drop unknown attributes like #[deprecated]
+        drain_filter(&mut attrs, |attr| {
+            !is_lint_attr(attr) && !attr.path().is_ident("doc")
+        });
+
         let vis: Visibility = input.parse()?;
-        let sig: Signature = input.parse()?;
+        let mut sig: Signature = input.parse()?;
+        maybe_modify_return_type(&mut sig.output);
 
         // The body is left untouched, so it will not cause an error
         // even if the syntax is invalid.
@@ -637,14 +757,44 @@ impl Prop {
                 abort!(e.span(), e.to_string());
             });
 
-        let name = if let Pat::Ident(i) = *typed.pat {
-            i
-        } else {
-            abort!(
-                typed.pat,
-                "only `prop: bool` style types are allowed within the \
-                 `#[component]` macro"
-            );
+        let name = match *typed.pat {
+            Pat::Ident(i) => {
+                if let Some(name) = &prop_opts.name {
+                    PatIdent {
+                        attrs: vec![],
+                        by_ref: None,
+                        mutability: None,
+                        ident: Ident::new(name, i.span()),
+                        subpat: None,
+                    }
+                } else {
+                    i
+                }
+            }
+            Pat::Struct(_) | Pat::Tuple(_) | Pat::TupleStruct(_) => {
+                if let Some(name) = &prop_opts.name {
+                    PatIdent {
+                        attrs: vec![],
+                        by_ref: None,
+                        mutability: None,
+                        ident: Ident::new(name, typed.pat.span()),
+                        subpat: None,
+                    }
+                } else {
+                    abort!(
+                        typed.pat,
+                        "destructured props must be given a name e.g. \
+                         #[prop(name = \"data\")]"
+                    );
+                }
+            }
+            _ => {
+                abort!(
+                    typed.pat,
+                    "only `prop: bool` style types are allowed within the \
+                     `#[component]` macro"
+                );
+            }
         };
 
         Self {
@@ -683,8 +833,6 @@ impl Docs {
         let mut quote_ws = "".to_string();
         let mut view_code_fence_state = ViewCodeFenceState::Outside;
         // todo fix docs stuff
-        const RUST_START: &str = "# let runtime = ::leptos::create_runtime();";
-        const RUST_END: &str = "# runtime.dispose();";
         const RSX_START: &str = "# ::leptos::view! {";
         const RSX_END: &str = "# };";
 
@@ -712,15 +860,12 @@ impl Docs {
                                 .trim_start();
                             vec![
                                 format!("{leading_ws}{quotes}{rust_options}"),
-                                format!("{leading_ws}{RUST_START}"),
+                                format!("{leading_ws}"),
                             ]
                         }
                         ViewCodeFenceState::Rust if trimmed_doc == quotes => {
                             view_code_fence_state = ViewCodeFenceState::Outside;
-                            vec![
-                                format!("{leading_ws}{RUST_END}"),
-                                doc.to_owned(),
-                            ]
+                            vec![format!("{leading_ws}"), doc.to_owned()]
                         }
                         ViewCodeFenceState::Rust
                             if trimmed_doc.starts_with('<') =>
@@ -769,7 +914,7 @@ impl Docs {
 
         if view_code_fence_state != ViewCodeFenceState::Outside {
             if view_code_fence_state == ViewCodeFenceState::Rust {
-                attrs.push((format!("{quote_ws}{RUST_END}"), Span::call_site()))
+                attrs.push((quote_ws.clone(), Span::call_site()))
             } else {
                 attrs.push((format!("{quote_ws}{RSX_END}"), Span::call_site()))
             }
@@ -808,6 +953,50 @@ impl Docs {
     }
 }
 
+fn is_lint_attr(attr: &Attribute) -> bool {
+    let path = &attr.path();
+    path.is_ident("allow")
+        || path.is_ident("warn")
+        || path.is_ident("expect")
+        || path.is_ident("deny")
+        || path.is_ident("forbid")
+}
+
+pub struct UnknownAttrs(Vec<(TokenStream, Span)>);
+
+impl UnknownAttrs {
+    pub fn new(attrs: &[Attribute]) -> Self {
+        let attrs = attrs
+            .iter()
+            .filter_map(|attr| {
+                if attr.path().is_ident("doc") {
+                    if let Meta::NameValue(_) = &attr.meta {
+                        return None;
+                    }
+                }
+
+                if is_lint_attr(attr) {
+                    return None;
+                }
+
+                Some((attr.into_token_stream(), attr.span()))
+            })
+            .collect_vec();
+        Self(attrs)
+    }
+}
+
+impl ToTokens for UnknownAttrs {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let s = self
+            .0
+            .iter()
+            .map(|(attr, span)| quote_spanned!(*span=> #attr))
+            .collect::<TokenStream>();
+        tokens.append_all(s);
+    }
+}
+
 #[derive(Clone, Debug, FromAttr)]
 #[attribute(ident = prop)]
 struct PropOpt {
@@ -821,27 +1010,30 @@ struct PropOpt {
     default: Option<syn::Expr>,
     into: bool,
     attrs: bool,
+    name: Option<String>,
 }
 
-struct TypedBuilderOpts {
+struct TypedBuilderOpts<'a> {
     default: bool,
     default_with_value: Option<syn::Expr>,
     strip_option: bool,
     into: bool,
+    ty: &'a Type,
 }
 
-impl TypedBuilderOpts {
-    fn from_opts(opts: &PropOpt, is_ty_option: bool) -> Self {
+impl<'a> TypedBuilderOpts<'a> {
+    fn from_opts(opts: &PropOpt, ty: &'a Type) -> Self {
         Self {
             default: opts.optional || opts.optional_no_strip || opts.attrs,
             default_with_value: opts.default.clone(),
-            strip_option: opts.strip_option || opts.optional && is_ty_option,
+            strip_option: opts.strip_option || opts.optional && is_option(ty),
             into: opts.into,
+            ty,
         }
     }
 }
 
-impl TypedBuilderOpts {
+impl TypedBuilderOpts<'_> {
     fn to_serde_tokens(&self) -> TokenStream {
         let default = if let Some(v) = &self.default_with_value {
             let v = v.to_token_stream().to_string();
@@ -860,7 +1052,7 @@ impl TypedBuilderOpts {
     }
 }
 
-impl ToTokens for TypedBuilderOpts {
+impl ToTokens for TypedBuilderOpts<'_> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let default = if let Some(v) = &self.default_with_value {
             let v = v.to_token_stream().to_string();
@@ -871,14 +1063,29 @@ impl ToTokens for TypedBuilderOpts {
             quote! {}
         };
 
-        let strip_option = if self.strip_option {
+        // If self.strip_option && self.into, then the strip_option will be represented as part of the transform closure.
+        let strip_option = if self.strip_option && !self.into {
             quote! { strip_option, }
         } else {
             quote! {}
         };
 
         let into = if self.into {
-            quote! { into, }
+            if !self.strip_option {
+                let ty = &self.ty;
+                quote! {
+                    fn transform<__IntoReactiveValueMarker>(value: impl ::leptos::prelude::IntoReactiveValue<#ty, __IntoReactiveValueMarker>) -> #ty {
+                        value.into_reactive_value()
+                    },
+                }
+            } else {
+                let ty = unwrap_option(self.ty);
+                quote! {
+                    fn transform<__IntoReactiveValueMarker>(value: impl ::leptos::prelude::IntoReactiveValue<#ty, __IntoReactiveValueMarker>) -> Option<#ty> {
+                        Some(value.into_reactive_value())
+                    },
+                }
+            }
         } else {
             quote! {}
         };
@@ -914,8 +1121,7 @@ fn prop_builder_fields(
                 ty,
             } = prop;
 
-            let builder_attrs =
-                TypedBuilderOpts::from_opts(prop_opts, is_option(ty));
+            let builder_attrs = TypedBuilderOpts::from_opts(prop_opts, ty);
 
             let builder_docs = prop_to_doc(prop, PropDocStyle::Inline);
 
@@ -960,8 +1166,7 @@ fn prop_serializer_fields(vis: &Visibility, props: &[Prop]) -> TokenStream {
                     ty,
                 } = prop;
 
-                let builder_attrs =
-                    TypedBuilderOpts::from_opts(prop_opts, is_option(ty));
+                let builder_attrs = TypedBuilderOpts::from_opts(prop_opts, ty);
                 let serde_attrs = builder_attrs.to_serde_tokens();
 
                 let PatIdent { ident, by_ref, .. } = &name;
@@ -1166,16 +1371,63 @@ fn prop_to_doc(
     }
 }
 
-fn is_valid_into_view_return_type(ty: &ReturnType) -> bool {
-    [
-        parse_quote!(-> impl IntoView),
-        parse_quote!(-> impl leptos::IntoView),
-        parse_quote!(-> impl ::leptos::IntoView),
-    ]
-    .iter()
-    .any(|test| ty == test)
+pub fn unmodified_fn_name_from_fn_name(ident: &Ident) -> Ident {
+    Ident::new(
+        &format!("__component_{}", ident.to_string().to_case(Snake)),
+        ident.span(),
+    )
 }
 
-pub fn unmodified_fn_name_from_fn_name(ident: &Ident) -> Ident {
-    Ident::new(&format!("__{ident}"), ident.span())
+/// Converts all `impl Trait`s in a function signature to use generic params instead.
+fn convert_impl_trait_to_generic(sig: &mut Signature) {
+    fn new_generic_ident(i: usize, span: Span) -> Ident {
+        Ident::new(&format!("__ImplTrait{i}"), span)
+    }
+
+    // First: visit all `impl Trait`s and replace them with new generic params.
+    #[derive(Default)]
+    struct RemoveImplTrait(Vec<TypeImplTrait>);
+    impl VisitMut for RemoveImplTrait {
+        fn visit_type_mut(&mut self, ty: &mut Type) {
+            syn::visit_mut::visit_type_mut(self, ty);
+            if matches!(ty, Type::ImplTrait(_)) {
+                let ident = new_generic_ident(self.0.len(), ty.span());
+                let generic_type = Type::Path(TypePath {
+                    qself: None,
+                    path: Path::from(ident),
+                });
+                let Type::ImplTrait(impl_trait) =
+                    std::mem::replace(ty, generic_type)
+                else {
+                    unreachable!();
+                };
+                self.0.push(impl_trait);
+            }
+        }
+
+        // Early exits.
+        fn visit_attribute_mut(&mut self, _: &mut Attribute) {}
+        fn visit_pat_mut(&mut self, _: &mut Pat) {}
+    }
+    let mut visitor = RemoveImplTrait::default();
+    for fn_arg in sig.inputs.iter_mut() {
+        visitor.visit_fn_arg_mut(fn_arg);
+    }
+    let RemoveImplTrait(impl_traits) = visitor;
+
+    // Second: Add the new generic params into the signature.
+    for (i, impl_trait) in impl_traits.into_iter().enumerate() {
+        let span = impl_trait.span();
+        let ident = new_generic_ident(i, span);
+        // We can simply append to the end (only lifetime params must be first).
+        // Note currently default generics are not allowed in `fn`, so not a concern.
+        sig.generics.params.push(GenericParam::Type(TypeParam {
+            attrs: vec![],
+            ident,
+            colon_token: Some(Colon { spans: [span] }),
+            bounds: impl_trait.bounds,
+            eq_token: None,
+            default: None,
+        }));
+    }
 }

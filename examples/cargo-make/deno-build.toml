@@ -1,9 +1,16 @@
+[tasks.cargo-all-features]
+install_script = '''
+cargo install cargo-all-features
+'''
+
 [tasks.build]
+install_crate = { crate_name = "wasm-pack", binary = "wasm-pack", test_arg = "--help" }
 clear = true
 command = "deno"
 args = ["task", "build"]
 
 [tasks.start-client]
+install_crate = { crate_name = "wasm-pack", binary = "wasm-pack", test_arg = "--help" }
 command = "deno"
 args = ["task", "start"]
 
@@ -12,13 +19,11 @@ clear = true
 dependencies = ["check-debug", "check-release"]
 
 [tasks.check-debug]
-toolchain = "nightly-2024-01-29"
+dependencies = ["cargo-all-features"]
 command = "cargo"
-args = ["check-all-features"]
-install_crate = "cargo-all-features"
+args = ["all-features", "clippy"]
 
 [tasks.check-release]
-toolchain = "nightly-2024-01-29"
+dependencies = ["cargo-all-features"]
 command = "cargo"
-args = ["check-all-features", "--release"]
-install_crate = "cargo-all-features"
+args = ["all-features", "clippy", "--release"]

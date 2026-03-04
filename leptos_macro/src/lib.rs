@@ -1,45 +1,30 @@
-#![cfg_attr(feature = "nightly", feature(proc_macro_span))]
+//! Macros for use with the Leptos framework.
+
+#![cfg_attr(all(feature = "nightly", rustc_nightly), feature(proc_macro_span))]
 #![forbid(unsafe_code)]
 // to prevent warnings from popping up when a nightly feature is stabilized
 #![allow(stable_features)]
 // FIXME? every use of quote! {} is warning here -- false positive?
 #![allow(unknown_lints)]
 #![allow(private_macro_use)]
+#![deny(missing_docs)]
 
 #[macro_use]
-extern crate proc_macro_error;
+extern crate proc_macro_error2;
 
 use component::DummyModel;
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenTree};
 use quote::{quote, ToTokens};
-use rstml::{node::KeyedAttribute, parse};
+use std::str::FromStr;
 use syn::{parse_macro_input, spanned::Spanned, token::Pub, Visibility};
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Mode {
-    Client,
-    Ssr,
-}
-
-impl Default for Mode {
-    fn default() -> Self {
-        if cfg!(feature = "hydrate")
-            || cfg!(feature = "csr")
-            || cfg!(feature = "web")
-        {
-            Mode::Client
-        } else {
-            Mode::Ssr
-        }
-    }
-}
 
 mod params;
 mod view;
 use crate::component::unmodified_fn_name_from_fn_name;
-use view::{client_template::render_template, render_view};
 mod component;
+mod lazy;
+mod memo;
 mod slice;
 mod slot;
 
@@ -48,48 +33,41 @@ mod slot;
 ///
 /// 1. Text content should be provided as a Rust string, i.e., double-quoted:
 /// ```rust
-/// # use leptos::*;
-/// # let runtime = create_runtime();
-/// # if !cfg!(any(feature = "csr", feature = "hydrate")) {
-/// view! { <p>"Here’s some text"</p> };
+/// # use leptos::prelude::*;
+/// # fn test() -> impl IntoView {
+/// view! { <p>"Here’s some text"</p> }
 /// # }
-/// # runtime.dispose();
 /// ```
 ///
 /// 2. Self-closing tags need an explicit `/` as in XML/XHTML
 /// ```rust,compile_fail
-/// # use leptos::*;
-/// # let runtime = create_runtime();
-/// # if !cfg!(any(feature = "csr", feature = "hydrate")) {
+/// # use leptos::prelude::*;
+///
+/// # fn test() -> impl IntoView {
 /// // ❌ not like this
 /// view! { <input type="text" name="name"> }
 /// # ;
 /// # }
-/// # runtime.dispose();
 /// ```
 /// ```rust
-/// # use leptos::*;
-/// # let runtime = create_runtime();
-/// # if !cfg!(any(feature = "csr", feature = "hydrate")) {
+/// # use leptos::prelude::*;
+/// # fn test() -> impl IntoView {
 /// // ✅ add that slash
 /// view! { <input type="text" name="name" /> }
-/// # ;
 /// # }
-/// # runtime.dispose();
 /// ```
 ///
 /// 3. Components (functions annotated with `#[component]`) can be inserted as camel-cased tags. (Generics
 ///    on components are specified as `<Component<T>/>`, not the turbofish `<Component::<T>/>`.)
 /// ```rust
-/// # use leptos::*;
-/// # let runtime = create_runtime();
+/// # use leptos::prelude::*;
+///
 /// # #[component]
 /// # fn Counter(initial_value: i32) -> impl IntoView { view! { <p></p>} }
-/// # if !cfg!(any(feature = "csr", feature = "hydrate")) {
+/// # fn test() -> impl IntoView {
 /// view! { <div><Counter initial_value=3 /></div> }
 /// # ;
 /// # }
-/// # runtime.dispose();
 /// ```
 ///
 /// 4. Dynamic content can be wrapped in curly braces (`{ }`) to insert text nodes, elements, or set attributes.
@@ -100,10 +78,13 @@ mod slot;
 ///    Attributes can take a wide variety of primitive types that can be converted to strings. They can also
 ///    take an `Option`, in which case `Some` sets the attribute and `None` removes the attribute.
 ///
+///    Note that in some cases, rust-analyzer support may be better if attribute values are surrounded with braces (`{}`).
+///    Unlike in JSX, attribute values are not required to be in braces, but braces can be used and may improve this LSP support.
+///
 /// ```rust,ignore
-/// # use leptos::*;
-/// # let runtime = create_runtime();
-/// # if !cfg!(any(feature = "csr", feature = "hydrate")) {
+/// # use leptos::prelude::*;
+///
+/// # fn test() -> impl IntoView {
 /// let (count, set_count) = create_signal(0);
 ///
 /// view! {
@@ -116,15 +97,13 @@ mod slot;
 /// }
 /// # ;
 /// # };
-/// # runtime.dispose();
 /// ```
 ///
 /// 5. Event handlers can be added with `on:` attributes. In most cases, the events are given the correct type
 ///    based on the event name.
 /// ```rust
-/// # use leptos::*;
-/// # let runtime = create_runtime();
-/// # if !cfg!(any(feature = "csr", feature = "hydrate")) {
+/// # use leptos::prelude::*;
+/// # fn test() -> impl IntoView {
 /// view! {
 ///   <button on:click=|ev| {
 ///     log::debug!("click event: {ev:#?}");
@@ -132,18 +111,15 @@ mod slot;
 ///     "Click me"
 ///   </button>
 /// }
-/// # ;
-/// # };
-/// # runtime.dispose();
+/// # }
 /// ```
 ///
 /// 6. DOM properties can be set with `prop:` attributes, which take any primitive type or `JsValue` (or a signal
 ///    that returns a primitive or JsValue). They can also take an `Option`, in which case `Some` sets the property
 ///    and `None` deletes the property.
 /// ```rust
-/// # use leptos::*;
-/// # let runtime = create_runtime();
-/// # if !cfg!(any(feature = "csr", feature = "hydrate")) {
+/// # use leptos::prelude::*;
+/// # fn test() -> impl IntoView {
 /// let (name, set_name) = create_signal("Alice".to_string());
 ///
 /// view! {
@@ -155,53 +131,41 @@ mod slot;
 ///     on:click=move |ev| set_name.set(event_target_value(&ev)) // `event_target_value` is a useful little Leptos helper
 ///   />
 /// }
-/// # ;
-/// # };
-/// # runtime.dispose();
+/// # }
 /// ```
 ///
 /// 7. Classes can be toggled with `class:` attributes, which take a `bool` (or a signal that returns a `bool`).
 /// ```rust
-/// # use leptos::*;
-/// # let runtime = create_runtime();
-/// # if !cfg!(any(feature = "csr", feature = "hydrate")) {
+/// # use leptos::prelude::*;
+/// # fn test() -> impl IntoView {
 /// let (count, set_count) = create_signal(2);
 /// view! { <div class:hidden-div={move || count.get() < 3}>"Now you see me, now you don’t."</div> }
-/// # ;
 /// # }
-/// # runtime.dispose();
 /// ```
 ///
 /// Class names can include dashes, and since v0.5.0 can include a dash-separated segment of only numbers.
 /// ```rust
-/// # use leptos::*;
-/// # let runtime = create_runtime();
-/// # if !cfg!(any(feature = "csr", feature = "hydrate")) {
+/// # use leptos::prelude::*;
+/// # fn test() -> impl IntoView {
 /// let (count, set_count) = create_signal(2);
 /// view! { <div class:hidden-div-25={move || count.get() < 3}>"Now you see me, now you don’t."</div> }
-/// # ;
-/// # };
-/// # runtime.dispose();
+/// # }
 /// ```
 ///
 /// Class names cannot include special symbols.
 /// ```rust,compile_fail
-/// # use leptos::*;
-/// # let runtime = create_runtime();
-/// # if !cfg!(any(feature = "csr", feature = "hydrate")) {
+/// # use leptos::prelude::*;
+/// # fn test() -> impl IntoView {
 /// let (count, set_count) = create_signal(2);
 /// // class:hidden-[div]-25 is invalid attribute name
 /// view! { <div class:hidden-[div]-25={move || count.get() < 3}>"Now you see me, now you don’t."</div> }
-/// # ;
-/// # };
-/// # runtime.dispose();
+/// # }
 /// ```
 ///
 /// However, you can pass arbitrary class names using the syntax `class=("name", value)`.
 /// ```rust
-/// # use leptos::*;
-/// # let runtime = create_runtime();
-/// # if !cfg!(any(feature = "csr", feature = "hydrate")) {
+/// # use leptos::prelude::*;
+/// # fn test() -> impl IntoView {
 /// let (count, set_count) = create_signal(2);
 /// // this allows you to use CSS frameworks that include complex class names
 /// view! {
@@ -211,16 +175,14 @@ mod slot;
 ///     "Now you see me, now you don’t."
 ///   </div>
 /// }
-/// # ;
-/// # };
-/// # runtime.dispose();
+/// # }
 /// ```
 ///
 /// 8. Individual styles can also be set with `style:` or `style=("property-name", value)` syntax.
 /// ```rust
-/// # use leptos::*;
-/// # let runtime = create_runtime();
-/// # if !cfg!(any(feature = "csr", feature = "hydrate")) {
+/// # use leptos::prelude::*;
+///
+/// # fn test() -> impl IntoView {
 /// let (x, set_x) = create_signal(0);
 /// let (y, set_y) = create_signal(0);
 /// view! {
@@ -233,67 +195,57 @@ mod slot;
 ///     "Moves when coordinates change"
 ///   </div>
 /// }
-/// # ;
-/// # };
-/// # runtime.dispose();
+/// # }
 /// ```
 ///
 /// 9. You can use the `node_ref` or `_ref` attribute to store a reference to its DOM element in a
-///    [NodeRef](https://docs.rs/leptos/latest/leptos/struct.NodeRef.html) to use later.
+///    [NodeRef](https://docs.rs/leptos/latest/leptos/prelude/struct.NodeRef.html) to use later.
 /// ```rust
-/// # use leptos::*;
-/// # let runtime = create_runtime();
-/// # if !cfg!(any(feature = "csr", feature = "hydrate")) {
+/// # use leptos::prelude::*;
+///
+/// # fn test() -> impl IntoView {
 /// use leptos::html::Input;
 ///
-/// let (value, set_value) = create_signal(0);
-/// let my_input = create_node_ref::<Input>();
-/// view! { <input type="text" _ref=my_input/> }
+/// let (value, set_value) = signal(0);
+/// let my_input = NodeRef::<Input>::new();
+/// view! { <input type="text" node_ref=my_input/> }
 /// // `my_input` now contains an `Element` that we can use anywhere
 /// # ;
 /// # };
-/// # runtime.dispose();
 /// ```
 ///
 /// 10. You can add the same class to every element in the view by passing in a special
 ///    `class = {/* ... */},` argument after ``. This is useful for injecting a class
 ///    provided by a scoped styling library.
 /// ```rust
-/// # use leptos::*;
-/// # let runtime = create_runtime();
-/// # if !cfg!(any(feature = "csr", feature = "hydrate")) {
+/// # use leptos::prelude::*;
+///
+/// # fn test() -> impl IntoView {
 /// let class = "mycustomclass";
 /// view! { class = class,
 ///   <div> // will have class="mycustomclass"
 ///     <p>"Some text"</p> // will also have class "mycustomclass"
 ///   </div>
 /// }
-/// # ;
-/// # };
-/// # runtime.dispose();
+/// # }
 /// ```
 ///
 /// 11. You can set any HTML element’s `innerHTML` with the `inner_html` attribute on an
 ///     element. Be careful: this HTML will not be escaped, so you should ensure that it
 ///     only contains trusted input.
 /// ```rust
-/// # use leptos::*;
-/// # let runtime = create_runtime();
-/// # if !cfg!(any(feature = "csr", feature = "hydrate")) {
+/// # use leptos::prelude::*;
+/// # fn test() -> impl IntoView {
 /// let html = "<p>This HTML will be injected.</p>";
 /// view! {
 ///   <div inner_html=html/>
 /// }
-/// # ;
-/// # };
-/// # runtime.dispose();
+/// # }
 /// ```
 ///
 /// Here’s a simple example that shows off several of these features, put together
 /// ```rust
-/// # use leptos::*;
-///
-/// # if !cfg!(any(feature = "csr", feature = "hydrate")) {
+/// # use leptos::prelude::*;
 /// pub fn SimpleCounter() -> impl IntoView {
 ///     // create a reactive signal with the initial value
 ///     let (value, set_value) = create_signal(0);
@@ -313,16 +265,30 @@ mod slot;
 ///         </div>
 ///     }
 /// }
-/// # ;
-/// # }
 /// ```
-#[proc_macro_error::proc_macro_error]
+#[proc_macro_error2::proc_macro_error]
 #[proc_macro]
-#[cfg_attr(
-    any(debug_assertions, feature = "ssr"),
-    tracing::instrument(level = "trace", skip_all,)
-)]
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip_all))]
 pub fn view(tokens: TokenStream) -> TokenStream {
+    view_macro_impl(tokens, false)
+}
+
+/// The `template` macro behaves like [`view`](view!), except that it wraps the entire tree in a
+/// [`ViewTemplate`](https://docs.rs/leptos/0.7.0-gamma3/leptos/prelude/struct.ViewTemplate.html). This optimizes creation speed by rendering
+/// most of the view into a `<template>` tag with HTML rendered at compile time, then hydrating it.
+/// In exchange, there is a small binary size overhead.
+#[proc_macro_error2::proc_macro_error]
+#[proc_macro]
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip_all))]
+pub fn template(tokens: TokenStream) -> TokenStream {
+    if cfg!(feature = "__internal_erase_components") {
+        view(tokens)
+    } else {
+        view_macro_impl(tokens, true)
+    }
+}
+
+fn view_macro_impl(tokens: TokenStream, template: bool) -> TokenStream {
     let tokens: proc_macro2::TokenStream = tokens.into();
     let mut tokens = tokens.into_iter();
 
@@ -359,53 +325,73 @@ pub fn view(tokens: TokenStream) -> TokenStream {
     };
     let config = rstml::ParserConfig::default().recover_block(true);
     let parser = rstml::Parser::new(config);
-    let (nodes, errors) = parser.parse_recoverable(tokens).split_vec();
+    let (mut nodes, errors) = parser.parse_recoverable(tokens).split_vec();
     let errors = errors.into_iter().map(|e| e.emit_as_expr_tokens());
-    let nodes_output = render_view(
-        &nodes,
-        Mode::default(),
+    let nodes_output = view::render_view(
+        &mut nodes,
         global_class.as_ref(),
         normalized_call_site(proc_macro::Span::call_site()),
+        template,
     );
-    quote! {
+
+    // The allow lint needs to be put here instead of at the expansion of
+    // view::attribute_value(). Adding this next to the expanded expression
+    // seems to break rust-analyzer, but it works when the allow is put here.
+    let output = quote! {
         {
-            #(#errors;)*
-            #nodes_output
+            #[allow(unused_braces)]
+            {
+                #(#errors;)*
+                #nodes_output
+            }
         }
+    };
+
+    if template {
+        quote! {
+            ::leptos::prelude::ViewTemplate::new(#output)
+        }
+    } else {
+        output
     }
     .into()
 }
 
 fn normalized_call_site(site: proc_macro::Span) -> Option<String> {
-    cfg_if::cfg_if! {
-        if #[cfg(all(debug_assertions, feature = "nightly"))] {
-            Some(leptos_hot_reload::span_to_stable_id(
-                site.source_file().path(),
-                site.start().line()
-            ))
-        } else {
-            _ = site;
-            None
-        }
+    if cfg!(debug_assertions) {
+        Some(leptos_hot_reload::span_to_stable_id(
+            site.file(),
+            site.start().line(),
+        ))
+    } else {
+        _ = site;
+        None
     }
 }
 
-/// An optimized, cached template for client-side rendering. Follows the same
-/// syntax as the [view!] macro. In hydration or server-side rendering mode,
-/// behaves exactly as the `view` macro. In client-side rendering mode, uses a `<template>`
-/// node to efficiently render the element. Should only be used with a single root element.
-#[proc_macro_error::proc_macro_error]
+/// This behaves like the [`view`](view!) macro, but loads the view from an external file instead of
+/// parsing it inline.
+///
+/// This is designed to allow editing views in a separate file, if this improves a user's workflow.
+///
+/// The file is loaded and parsed during proc-macro execution, and its path is resolved relative to
+/// the crate root rather than relative to the file from which it is called.
+#[proc_macro_error2::proc_macro_error]
 #[proc_macro]
-pub fn template(tokens: TokenStream) -> TokenStream {
-    if cfg!(feature = "csr") {
-        match parse(tokens) {
-            Ok(nodes) => render_template(&nodes),
-            Err(error) => error.to_compile_error(),
-        }
-        .into()
-    } else {
-        view(tokens)
-    }
+pub fn include_view(tokens: TokenStream) -> TokenStream {
+    let file_name = syn::parse::<syn::LitStr>(tokens).unwrap_or_else(|_| {
+        abort!(
+            Span::call_site(),
+            "the only supported argument is a string literal"
+        );
+    });
+    let file =
+        std::fs::read_to_string(file_name.value()).unwrap_or_else(|_| {
+            abort!(Span::call_site(), "could not open file");
+        });
+    let tokens = proc_macro2::TokenStream::from_str(&file)
+        .unwrap_or_else(|e| abort!(Span::call_site(), e));
+    view(tokens.into())
 }
 
 /// Annotates a function so that it can be used with your template as a Leptos `<Component/>`.
@@ -421,8 +407,9 @@ pub fn template(tokens: TokenStream) -> TokenStream {
 /// generate documentation for the component.
 ///
 /// Here’s how you would define and use a simple Leptos component which can accept custom properties for a name and age:
+///
 /// ```rust
-/// # use leptos::*;
+/// # use leptos::prelude::*;
 /// use std::time::Duration;
 ///
 /// #[component]
@@ -458,6 +445,7 @@ pub fn template(tokens: TokenStream) -> TokenStream {
 /// ```
 ///
 /// Here are some important details about how Leptos components work within the framework:
+///
 /// * **The component function only runs once.** Your component function is not a “render” function
 ///    that re-runs whenever changes happen in the state. It’s a “setup” function that runs once to
 ///    create the user interface, and sets up a reactive system to update it. This means it’s okay
@@ -469,8 +457,7 @@ pub fn template(tokens: TokenStream) -> TokenStream {
 ///    a particular tag is a component, not an HTML element.
 ///
 /// ```
-/// # use leptos::*;
-///
+/// # use leptos::prelude::*;
 /// // PascalCase: Generated component will be called MyComponent
 /// #[component]
 /// fn MyComponent() -> impl IntoView {}
@@ -480,48 +467,15 @@ pub fn template(tokens: TokenStream) -> TokenStream {
 /// fn my_snake_case_component() -> impl IntoView {}
 /// ```
 ///
-/// * You can pass generic arguments, and they can either be defined in a `where` clause
-/// or inline in the generic block, but not in an `impl` in function argument position.
-///
-/// ```compile_error
-/// // ❌ This won't work.
-/// # use leptos::*;
-/// use leptos::html::Div;
-///
-/// #[component]
-/// fn MyComponent<T: Fn() -> HtmlElement<Div>>(render_prop: impl Fn() -> HtmlElement<Div>) -> impl IntoView {
-/// }
-/// ```
-///
-/// ```
-/// // ✅ Do this instead
-/// # use leptos::*;
-/// use leptos::html::Div;
-///
-/// #[component]
-/// fn MyComponent<T>(render_prop: T) -> impl IntoView
-/// where
-///     T: Fn() -> HtmlElement<Div>,
-/// {
-/// }
-///
-/// // or
-/// #[component]
-/// fn MyComponent2<T: Fn() -> HtmlElement<Div>>(
-///     render_prop: T,
-/// ) -> impl IntoView {
-/// }
-/// ```
-///
 /// 5. You can access the children passed into the component with the `children` property, which takes
-///    an argument of the type `Children`. This is an alias for `Box<dyn FnOnce() -> Fragment>`.
+///    an argument of the type `Children`. This is an alias for `Box<dyn FnOnce() -> AnyView<_>>`.
 ///    If you need `children` to be a `Fn` or `FnMut`, you can use the `ChildrenFn` or `ChildrenFnMut`
-///    type aliases.
+///    type aliases. If you want to iterate over the children, you can take `ChildrenFragment`.
 ///
 /// ```
-/// # use leptos::*;
+/// # use leptos::prelude::*;
 /// #[component]
-/// fn ComponentWithChildren(children: Children) -> impl IntoView {
+/// fn ComponentWithChildren(children: ChildrenFragment) -> impl IntoView {
 ///     view! {
 ///       <ul>
 ///         {children()
@@ -545,13 +499,15 @@ pub fn template(tokens: TokenStream) -> TokenStream {
 /// ```
 ///
 /// ## Customizing Properties
+///
 /// You can use the `#[prop]` attribute on individual component properties (function arguments) to
 /// customize the types that component property can receive. You can use the following attributes:
+///
 /// * `#[prop(into)]`: This will call `.into()` on any value passed into the component prop. (For example,
 ///   you could apply `#[prop(into)]` to a prop that takes
-///   [Signal](https://docs.rs/leptos/latest/leptos/struct.Signal.html), which would
-///   allow users to pass a [ReadSignal](https://docs.rs/leptos/latest/leptos/struct.ReadSignal.html) or
-///   [RwSignal](https://docs.rs/leptos/latest/leptos/struct.RwSignal.html)
+///   [Signal](https://docs.rs/leptos/latest/leptos/prelude/struct.Signal.html), which would
+///   allow users to pass a [ReadSignal](https://docs.rs/leptos/latest/leptos/prelude/struct.ReadSignal.html) or
+///   [RwSignal](https://docs.rs/leptos/latest/leptos/prelude/struct.RwSignal.html)
 ///   and automatically convert it.)
 /// * `#[prop(optional)]`: If the user does not specify this property when they use the component,
 ///   it will be set to its default value. If the property type is `Option<T>`, values should be passed
@@ -559,14 +515,21 @@ pub fn template(tokens: TokenStream) -> TokenStream {
 /// * `#[prop(optional_no_strip)]`: The same as `optional`, but requires values to be passed as `None` or
 ///   `Some(T)` explicitly. This means that the optional property can be omitted (and be `None`), or explicitly
 ///   specified as either `None` or `Some(T)`.
+/// * `#[prop(default = <expr>)]`: Optional property that specifies a default value, which is used when the
+///   property is not specified.
+/// * `#[prop(name = "new_name")]`: Specifiy a different name for the property. Can be used to destructure
+///   fields in component function parameters (see example below).
+///
 /// ```rust
-/// # use leptos::*;
+/// # use leptos::prelude::*;
 ///
 /// #[component]
 /// pub fn MyComponent(
 ///     #[prop(into)] name: String,
 ///     #[prop(optional)] optional_value: Option<i32>,
 ///     #[prop(optional_no_strip)] optional_no_strip: Option<i32>,
+///     #[prop(default = 7)] optional_default: i32,
+///     #[prop(name = "data")] UserInfo { email, user_id }: UserInfo,
 /// ) -> impl IntoView {
 ///     // whatever UI you need
 /// }
@@ -575,18 +538,26 @@ pub fn template(tokens: TokenStream) -> TokenStream {
 /// pub fn App() -> impl IntoView {
 ///     view! {
 ///       <MyComponent
-///         name="Greg" // automatically converted to String with `.into()`
-///         optional_value=42 // received as `Some(42)`
-///         optional_no_strip=Some(42) // received as `Some(42)`
+///         name="Greg"  // automatically converted to String with `.into()`
+///         optional_value=42  // received as `Some(42)`
+///         optional_no_strip=Some(42)  // received as `Some(42)`
+///         optional_default=42  // received as `42`
+///         data=UserInfo {email: "foo", user_id: "bar" }
 ///       />
 ///       <MyComponent
 ///         name="Bob" // automatically converted to String with `.into()`
-///         // optional values can both be omitted, and received as `None`
+///         data=UserInfo {email: "foo", user_id: "bar" }
+///         // optional values can be omitted
 ///       />
 ///     }
 /// }
+///
+/// pub struct UserInfo {
+///     pub email: &'static str,
+///     pub user_id: &'static str,
+/// }
 /// ```
-#[proc_macro_error::proc_macro_error]
+#[proc_macro_error2::proc_macro_error]
 #[proc_macro_attribute]
 pub fn component(args: proc_macro::TokenStream, s: TokenStream) -> TokenStream {
     let is_transparent = if !args.is_empty() {
@@ -605,37 +576,14 @@ pub fn component(args: proc_macro::TokenStream, s: TokenStream) -> TokenStream {
         false
     };
 
-    let Ok(mut dummy) = syn::parse::<DummyModel>(s.clone()) else {
-        return s;
-    };
-    let parse_result = syn::parse::<component::Model>(s);
-
-    if let (ref mut unexpanded, Ok(model)) = (&mut dummy, parse_result) {
-        let expanded = model.is_transparent(is_transparent).into_token_stream();
-        unexpanded.sig.ident =
-            unmodified_fn_name_from_fn_name(&unexpanded.sig.ident);
-        quote! {
-            #expanded
-            #[doc(hidden)]
-            #[allow(non_snake_case, dead_code, clippy::too_many_arguments)]
-            #unexpanded
-        }
-    } else {
-        dummy.sig.ident = unmodified_fn_name_from_fn_name(&dummy.sig.ident);
-        quote! {
-            #[doc(hidden)]
-            #[allow(non_snake_case, dead_code, clippy::too_many_arguments)]
-            #dummy
-        }
-    }
-    .into()
+    component_macro(s, is_transparent, false, None)
 }
 
 /// Defines a component as an interactive island when you are using the
-/// `experimental-islands` feature of Leptos. Apart from the macro name,
+/// `islands` feature of Leptos. Apart from the macro name,
 /// the API is the same as the [`component`](macro@component) macro.
 ///
-/// When you activate the `experimental-islands` feature, every `#[component]`
+/// When you activate the `islands` feature, every `#[component]`
 /// is server-only by default. This "default to server" behavior is important:
 /// you opt into shipping code to the client, rather than opting out. You can
 /// opt into client-side interactivity for any given component by changing from
@@ -664,7 +612,7 @@ pub fn component(args: proc_macro::TokenStream, s: TokenStream) -> TokenStream {
 ///
 /// ## Example
 /// ```rust,ignore
-/// use leptos::*;
+/// use leptos::prelude::*;
 ///
 /// #[component]
 /// pub fn App() -> impl IntoView {
@@ -702,16 +650,44 @@ pub fn component(args: proc_macro::TokenStream, s: TokenStream) -> TokenStream {
 ///     }
 /// }
 /// ```
-#[proc_macro_error::proc_macro_error]
+#[proc_macro_error2::proc_macro_error]
 #[proc_macro_attribute]
-pub fn island(_args: proc_macro::TokenStream, s: TokenStream) -> TokenStream {
-    let Ok(mut dummy) = syn::parse::<DummyModel>(s.clone()) else {
-        return s;
+pub fn island(args: proc_macro::TokenStream, s: TokenStream) -> TokenStream {
+    let (is_transparent, is_lazy) = if !args.is_empty() {
+        let arg = parse_macro_input!(args as syn::Ident);
+
+        if arg != "transparent" && arg != "lazy" {
+            abort!(
+                arg,
+                "only `transparent` or `lazy` are supported";
+                help = "try `#[island(transparent)]`, `#[island(lazy)]`, or `#[island]`"
+            );
+        }
+
+        (arg == "transparent", arg == "lazy")
+    } else {
+        (false, false)
     };
+
+    let island_src = s.to_string();
+    component_macro(s, is_transparent, is_lazy, Some(island_src))
+}
+
+fn component_macro(
+    s: TokenStream,
+    is_transparent: bool,
+    is_lazy: bool,
+    island: Option<String>,
+) -> TokenStream {
+    let mut dummy = syn::parse::<DummyModel>(s.clone());
     let parse_result = syn::parse::<component::Model>(s);
 
-    if let (ref mut unexpanded, Ok(model)) = (&mut dummy, parse_result) {
-        let expanded = model.is_island().into_token_stream();
+    if let (Ok(ref mut unexpanded), Ok(model)) = (&mut dummy, parse_result) {
+        let expanded = model
+            .is_transparent(is_transparent)
+            .is_lazy(is_lazy)
+            .with_island(island)
+            .into_token_stream();
         if !matches!(unexpanded.vis, Visibility::Public(_)) {
             unexpanded.vis = Visibility::Public(Pub {
                 span: unexpanded.vis.span(),
@@ -719,21 +695,29 @@ pub fn island(_args: proc_macro::TokenStream, s: TokenStream) -> TokenStream {
         }
         unexpanded.sig.ident =
             unmodified_fn_name_from_fn_name(&unexpanded.sig.ident);
+
         quote! {
             #expanded
+
             #[doc(hidden)]
-            #[allow(non_snake_case, dead_code, clippy::too_many_arguments)]
+            #[allow(clippy::too_many_arguments, clippy::needless_lifetimes)]
             #unexpanded
         }
     } else {
-        dummy.sig.ident = unmodified_fn_name_from_fn_name(&dummy.sig.ident);
-        quote! {
-            #[doc(hidden)]
-            #[allow(non_snake_case, dead_code, clippy::too_many_arguments)]
-            #dummy
+        match dummy {
+            Ok(mut dummy) => {
+                dummy.sig.ident = unmodified_fn_name_from_fn_name(&dummy.sig.ident);
+                quote! {
+                    #[doc(hidden)]
+                    #[allow(clippy::too_many_arguments, clippy::needless_lifetimes)]
+                    #dummy
+                }
+            }
+            Err(e) => {
+                proc_macro_error2::abort!(e.span(), e);
+            }
         }
-    }
-    .into()
+    }.into()
 }
 
 /// Annotates a struct so that it can be used with your Component as a `slot`.
@@ -745,7 +729,7 @@ pub fn island(_args: proc_macro::TokenStream, s: TokenStream) -> TokenStream {
 ///
 /// Here’s how you would define and use a simple Leptos component which can accept a custom slot:
 /// ```rust
-/// # use leptos::*;
+/// # use leptos::prelude::*;
 /// use std::time::Duration;
 ///
 /// #[slot]
@@ -757,16 +741,10 @@ pub fn island(_args: proc_macro::TokenStream, s: TokenStream) -> TokenStream {
 ///
 /// #[component]
 /// fn HelloComponent(
-///     
 ///     /// Component slot, should be passed through the <HelloSlot slot> syntax.
 ///     hello_slot: HelloSlot,
 /// ) -> impl IntoView {
-///     // mirror the children from the slot, if any were passed
-///     if let Some(children) = hello_slot.children {
-///         (children)().into_view()
-///     } else {
-///         ().into_view()
-///     }
+///     hello_slot.children.map(|children| children())
 /// }
 ///
 /// #[component]
@@ -791,7 +769,7 @@ pub fn island(_args: proc_macro::TokenStream, s: TokenStream) -> TokenStream {
 ///
 /// ```compile_error
 /// // ❌ This won't work
-/// # use leptos::*;
+/// # use leptos::prelude::*;
 ///
 /// #[slot]
 /// struct SlotWithChildren {
@@ -817,7 +795,7 @@ pub fn island(_args: proc_macro::TokenStream, s: TokenStream) -> TokenStream {
 ///
 /// ```
 /// // ✅ Do this instead
-/// # use leptos::*;
+/// # use leptos::prelude::*;
 ///
 /// #[slot]
 /// struct SlotWithChildren {
@@ -842,7 +820,7 @@ pub fn island(_args: proc_macro::TokenStream, s: TokenStream) -> TokenStream {
 ///     }
 /// }
 /// ```
-#[proc_macro_error::proc_macro_error]
+#[proc_macro_error2::proc_macro_error]
 #[proc_macro_attribute]
 pub fn slot(args: proc_macro::TokenStream, s: TokenStream) -> TokenStream {
     if !args.is_empty() {
@@ -971,7 +949,7 @@ pub fn server(args: proc_macro::TokenStream, s: TokenStream) -> TokenStream {
         args.into(),
         s.into(),
         Some(syn::parse_quote!(::leptos::server_fn)),
-        "/api",
+        option_env!("SERVER_FN_PREFIX").unwrap_or("/api"),
         None,
         None,
     ) {
@@ -982,7 +960,7 @@ pub fn server(args: proc_macro::TokenStream, s: TokenStream) -> TokenStream {
 
 /// Derives a trait that parses a map of string keys and values into a typed
 /// data structure, e.g., for route params.
-#[proc_macro_derive(Params, attributes(params))]
+#[proc_macro_derive(Params)]
 pub fn params_derive(
     input: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
@@ -992,21 +970,13 @@ pub fn params_derive(
     }
 }
 
-pub(crate) fn attribute_value(attr: &KeyedAttribute) -> &syn::Expr {
-    match attr.value() {
-        Some(value) => value,
-        None => abort!(attr.key, "attribute should have value"),
-    }
-}
-
 /// Generates a `slice` into a struct with a default getter and setter.
 ///
 /// Can be used to access deeply nested fields within a global state object.
 ///
 /// ```rust
-/// # use leptos::{create_runtime, create_rw_signal};
+/// # use leptos::prelude::*;
 /// # use leptos_macro::slice;
-/// # let runtime = create_runtime();
 ///
 /// #[derive(Default)]
 /// pub struct Outer {
@@ -1020,7 +990,7 @@ pub(crate) fn attribute_value(attr: &KeyedAttribute) -> &syn::Expr {
 ///     inner_name: String,
 /// }
 ///
-/// let outer_signal = create_rw_signal(Outer::default());
+/// let outer_signal = RwSignal::new(Outer::default());
 ///
 /// let (count, set_count) = slice!(outer_signal.count);
 ///
@@ -1030,4 +1000,77 @@ pub(crate) fn attribute_value(attr: &KeyedAttribute) -> &syn::Expr {
 #[proc_macro]
 pub fn slice(input: TokenStream) -> TokenStream {
     slice::slice_impl(input)
+}
+
+/// Generates a `memo` into a struct with a default getter.
+///
+/// Can be used to access deeply nested fields within a global state object.
+///
+/// ```rust
+/// # use leptos::prelude::*;
+/// # use leptos_macro::memo;
+///
+/// #[derive(Default)]
+/// pub struct Outer {
+///     count: i32,
+///     inner: Inner,
+/// }
+///
+/// #[derive(Default)]
+/// pub struct Inner {
+///     inner_count: i32,
+///     inner_name: String,
+/// }
+///
+/// let outer_signal = RwSignal::new(Outer::default());
+///
+/// let count = memo!(outer_signal.count);
+///
+/// let inner_count = memo!(outer_signal.inner.inner_count);
+/// let inner_name = memo!(outer_signal.inner.inner_name);
+/// ```
+#[proc_macro]
+pub fn memo(input: TokenStream) -> TokenStream {
+    memo::memo_impl(input)
+}
+
+/// The `#[lazy]` macro indicates that a function can be lazy-loaded from a separate WebAssembly (WASM) binary.
+///
+/// The first time the function is called, calling the function will first load that other binary,
+/// then call the function. On subsequent calls it will be called immediately, but still return
+/// asynchronously to maintain the same API.
+///
+/// `#[lazy]` can be used to annotate synchronous or `async` functions. In both cases, the final function will be
+/// `async` and must be called as such.
+///
+/// All parameters and output types should be concrete types, with no generics or `impl Trait` types.
+///
+/// This should be used in tandem with a suitable build process, such as `cargo leptos --split`.
+///
+/// ```rust
+/// # use leptos_macro::lazy;
+///
+/// #[lazy]
+/// fn lazy_synchronous_function() -> String {
+///     "Hello, lazy world!".to_string()
+/// }
+///
+/// #[lazy]
+/// async fn lazy_async_function() -> String {
+///     /* do something that requires async work */
+///     "Hello, lazy async world!".to_string()
+/// }
+///
+/// async fn use_lazy_functions() {
+///     // synchronous function has been converted to async
+///     let value1 = lazy_synchronous_function().await;
+///
+///     // async function is still async
+///     let value1 = lazy_async_function().await;
+/// }
+/// ```
+#[proc_macro_attribute]
+#[proc_macro_error]
+pub fn lazy(args: proc_macro::TokenStream, s: TokenStream) -> TokenStream {
+    lazy::lazy_impl(args, s)
 }

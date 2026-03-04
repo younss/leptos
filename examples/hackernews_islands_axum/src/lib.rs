@@ -1,14 +1,32 @@
-#![feature(lazy_cell)]
-
-use leptos::*;
-use leptos_meta::*;
-use leptos_router::*;
+use leptos::prelude::*;
 mod api;
-pub mod error_template;
+mod routes;
+use leptos_meta::{provide_meta_context, Link, Meta, MetaTags, Stylesheet};
+use leptos_router::{
+    components::{FlatRoutes, Route, Router},
+    OptionalParamSegment, ParamSegment, StaticSegment,
+};
+use routes::{nav::*, stories::*, story::*, users::*};
 #[cfg(feature = "ssr")]
 pub mod fallback;
-mod routes;
-use routes::{nav::*, stories::*, story::*, users::*};
+
+pub fn shell(options: LeptosOptions) -> impl IntoView {
+    view! {
+        <!DOCTYPE html>
+        <html lang="en">
+            <head>
+                <meta charset="utf-8"/>
+                <meta name="viewport" content="width=device-width, initial-scale=1"/>
+                <AutoReload options=options.clone() />
+                <HydrationScripts options islands=true/>
+                <MetaTags/>
+            </head>
+            <body>
+                <App/>
+            </body>
+        </html>
+    }
+}
 
 #[component]
 pub fn App() -> impl IntoView {
@@ -21,11 +39,11 @@ pub fn App() -> impl IntoView {
         <Router>
             <Nav />
             <main>
-                <Routes>
-                    <Route path="users/:id" view=User ssr=SsrMode::InOrder/>
-                    <Route path="stories/:id" view=Story ssr=SsrMode::InOrder/>
-                    <Route path=":stories?" view=Stories ssr=SsrMode::InOrder/>
-                </Routes>
+                <FlatRoutes fallback=|| "Not found.">
+                    <Route path=(StaticSegment("users"), ParamSegment("id")) view=User/>
+                    <Route path=(StaticSegment("stories"), ParamSegment("id")) view=Story/>
+                    <Route path=OptionalParamSegment("stories") view=Stories/>
+                </FlatRoutes>
             </main>
         </Router>
     }
@@ -34,7 +52,6 @@ pub fn App() -> impl IntoView {
 #[cfg(feature = "hydrate")]
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn hydrate() {
-    #[cfg(debug_assertions)]
     console_error_panic_hook::set_once();
-    leptos::leptos_dom::HydrationCtx::stop_hydrating();
+    leptos::mount::hydrate_islands();
 }

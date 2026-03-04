@@ -1,31 +1,40 @@
 [package]
 name = "leptos_meta"
-version = "0.6.9"
-edition = "2021"
+version = "0.8.6"
 authors = ["Greg Johnston"]
 license = "MIT"
 repository = "https://github.com/leptos-rs/leptos"
 description = "Tools to set HTML metadata in the Leptos web framework."
 rust-version.workspace = true
+edition.workspace = true
 
 [dependencies]
-cfg-if = "1"
 leptos = { workspace = true }
-tracing = "0.1"
-wasm-bindgen = "0.2"
-indexmap = "2"
+or_poisoned = { workspace = true }
+indexmap = { workspace = true, default-features = true }
+send_wrapper = { workspace = true, default-features = true }
+tracing = { optional = true, workspace = true, default-features = true }
+wasm-bindgen = { workspace = true, default-features = true }
+futures = { workspace = true, default-features = true }
 
 [dependencies.web-sys]
-version = "0.3"
 features = ["HtmlLinkElement", "HtmlMetaElement", "HtmlTitleElement"]
+workspace = true
+default-features = true
 
 [features]
 default = []
-csr = ["leptos/csr"]
-hydrate = ["leptos/hydrate"]
-ssr = ["leptos/ssr"]
-nightly = ["leptos/nightly"]
+ssr = []
+tracing = ["dep:tracing"]
+nonce = ["leptos/nonce"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--generate-link-to-definition"]
 
 [package.metadata.cargo-all-features]
-denylist = ["nightly"]
-skip_feature_sets = [["csr", "ssr"], ["csr", "hydrate"], ["ssr", "hydrate"]]
+denylist = ["tracing"]
+max_combination_size = 2
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(leptos_debuginfo)'] }

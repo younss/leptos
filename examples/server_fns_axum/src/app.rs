@@ -1,17 +1,18 @@
-use futures::StreamExt;
+use futures::{Sink, Stream, StreamExt};
 use http::Method;
-use leptos::{html::Input, *};
-use leptos_meta::{provide_meta_context, Link, Meta, Stylesheet};
-use leptos_router::{ActionForm, Route, Router, Routes};
+use leptos::{html::Input, prelude::*, task::spawn_local};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use server_fn::{
     client::{browser::BrowserClient, Client},
     codec::{
         Encoding, FromReq, FromRes, GetUrl, IntoReq, IntoRes, MultipartData,
-        MultipartFormData, Rkyv, SerdeLite, StreamingText, TextStream,
+        MultipartFormData, Postcard, Rkyv, RkyvEncoding, SerdeLite,
+        StreamingText, TextStream,
     },
+    error::{FromServerFnError, IntoAppError, ServerFnErrorErr},
     request::{browser::BrowserRequest, ClientReq, Req},
-    response::{browser::BrowserResponse, ClientRes, Res},
+    response::{browser::BrowserResponse, ClientRes, TryRes},
+    ContentType, Format, FormatType,
 };
 use std::future::Future;
 #[cfg(feature = "ssr")]
@@ -23,24 +24,35 @@ use strum::{Display, EnumString};
 use wasm_bindgen::JsCast;
 use web_sys::{FormData, HtmlFormElement, SubmitEvent};
 
-#[component]
-pub fn TodoApp() -> impl IntoView {
-    provide_meta_context();
-
+pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
-        <Meta name="color-scheme" content="dark light"/>
-        <Link rel="shortcut icon" type_="image/ico" href="/favicon.ico"/>
-        <Stylesheet id="leptos" href="/pkg/server_fns_axum.css"/>
-        <Router>
-            <header>
-                <h1>"Server Function Demo"</h1>
-            </header>
-            <main>
-                <Routes>
-                    <Route path="" view=HomePage/>
-                </Routes>
-            </main>
-        </Router>
+        <!DOCTYPE html>
+        <html lang="en">
+            <head>
+                <meta charset="utf-8" />
+                <meta name="viewport" content="width=device-width, initial-scale=1" />
+                <AutoReload options=options.clone() />
+                <HydrationScripts options />
+                <meta name="color-scheme" content="dark light" />
+                <link rel="shortcut icon" type="image/ico" href="/favicon.ico" />
+                <link rel="stylesheet" id="leptos" href="/pkg/server_fns_axum.css" />
+            </head>
+            <body>
+                <App />
+            </body>
+        </html>
+    }
+}
+
+#[component]
+pub fn App() -> impl IntoView {
+    view! {
+        <header>
+            <h1>"Server Function Demo"</h1>
+        </header>
+        <main>
+            <HomePage />
+        </main>
     }
 }
 
@@ -48,19 +60,20 @@ pub fn TodoApp() -> impl IntoView {
 pub fn HomePage() -> impl IntoView {
     view! {
         <h2>"Some Simple Server Functions"</h2>
-        <SpawnLocal/>
-        <WithAnAction/>
-        <WithActionForm/>
+        <SpawnLocal />
+        <WithAnAction />
+        <WithActionForm />
         <h2>"Custom Error Types"</h2>
-        <CustomErrorTypes/>
+        <CustomErrorTypes />
         <h2>"Alternative Encodings"</h2>
-        <ServerFnArgumentExample/>
-        <RkyvExample/>
-        <FileUpload/>
-        <FileUploadWithProgress/>
-        <FileWatcher/>
-        <CustomEncoding/>
-        <CustomClientExample/>
+        <ServerFnArgumentExample />
+        <RkyvExample />
+        <PostcardExample />
+        <FileUpload />
+        <FileUploadWithProgress />
+        <FileWatcher />
+        <CustomEncoding />
+        <CustomClientExample />
     }
 }
 
@@ -87,25 +100,24 @@ pub fn SpawnLocal() -> impl IntoView {
     }
 
     let input_ref = NodeRef::<Input>::new();
-    let (shout_result, set_shout_result) =
-        create_signal("Click me".to_string());
+    let (shout_result, set_shout_result) = signal("Click me".to_string());
 
     view! {
         <h3>Using <code>spawn_local</code></h3>
         <p>
-            "You can call a server function by using "<code>"spawn_local"</code> " in an event listener. "
+            "You can call a server function by using " <code>"spawn_local"</code>
+            " in an event listener. "
             "Clicking this button should alert with the uppercase version of the input."
         </p>
-        <input node_ref=input_ref placeholder="Type something here."/>
-        <button
-            on:click=move |_| {
-                let value = input_ref.get().unwrap().value();
-                spawn_local(async move {
-                    let uppercase_text = shouting_text(value).await.unwrap_or_else(|e| e.to_string());
-                    set_shout_result(uppercase_text);
-                });
-            }
-        >
+        <input node_ref=input_ref placeholder="Type something here." />
+        <button on:click=move |_| {
+            let value = input_ref.get().unwrap().value();
+            spawn_local(async move {
+                let uppercase_text = shouting_text(value).await.unwrap_or_else(|e| e.to_string());
+                set_shout_result.set(uppercase_text);
+            });
+        }>
+
             {shout_result}
         </button>
     }
@@ -163,30 +175,25 @@ pub fn WithAnAction() -> impl IntoView {
 
     // a server action can be created by using the server function's type name as a generic
     // the type name defaults to the PascalCased function name
-    let action = create_server_action::<AddRow>();
+    let action = ServerAction::<AddRow>::new();
 
     // this resource will hold the total number of rows
     // passing it action.version() means it will refetch whenever the action resolves successfully
-    let row_count = create_resource(action.version(), |_| get_rows());
+    let row_count =
+        Resource::new(move || action.version().get(), |_| get_rows());
 
     view! {
-        <h3>Using <code>create_action</code></h3>
+        <h3>Using <code>Action::new</code></h3>
         <p>
             "Some server functions are conceptually \"mutations,\", which change something on the server. "
             "These often work well as actions."
         </p>
-        <input node_ref=input_ref placeholder="Type something here."/>
-        <button
-            on:click=move |_| {
-                let text = input_ref.get().unwrap().value();
-                action.dispatch(text.into());
-                // note: technically, this `action` takes `AddRow` (the server fn type) as its
-                // argument
-                //
-                // however, for any one-argument server functions, `From<_>` is implemented between
-                // the server function type and the type of this single argument
-            }
-        >
+        <input node_ref=input_ref placeholder="Type something here." />
+        <button on:click=move |_| {
+            let text = input_ref.get().unwrap().value();
+            action.dispatch(text.into());
+        }>
+
             Submit
         </button>
         <p>You submitted: {move || format!("{:?}", action.input().get())}</p>
@@ -205,13 +212,16 @@ pub fn WithAnAction() -> impl IntoView {
 /// message if the server function returns an error. Otherwise, it loads the new resource data.
 #[component]
 pub fn WithActionForm() -> impl IntoView {
-    let action = create_server_action::<AddRow>();
-    let row_count = create_resource(action.version(), |_| get_rows());
+    let action = ServerAction::<AddRow>::new();
+    let row_count =
+        Resource::new(move || action.version().get(), |_| get_rows());
 
     view! {
         <h3>Using <code>"<ActionForm/>"</code></h3>
         <p>
-            <code>"<ActionForm/>"</code> "lets you use an HTML " <code>"<form>"</code>
+            <code>"<ActionForm/>"</code>
+            "lets you use an HTML "
+            <code>"<form>"</code>
             "to call a server function in a way that gracefully degrades."
         </p>
         <ActionForm action>
@@ -220,11 +230,12 @@ pub fn WithActionForm() -> impl IntoView {
                 name="text"
                 placeholder="Type something here."
             />
-            <button> Submit </button>
+            <button>Submit</button>
         </ActionForm>
         <p>You submitted: {move || format!("{:?}", action.input().get())}</p>
         <p>The result was: {move || format!("{:?}", action.value().get())}</p>
-        <Transition>archive underaligned: need alignment 4 but have alignment 1
+        <Transition>
+            archive underaligned: need alignment 4 but have alignment 1
             <p>Total rows: {row_count}</p>
         </Transition>
     }
@@ -259,28 +270,25 @@ pub async fn length_of_input(input: String) -> Result<usize, ServerFnError> {
 #[component]
 pub fn ServerFnArgumentExample() -> impl IntoView {
     let input_ref = NodeRef::<Input>::new();
-    let (result, set_result) = create_signal(0);
+    let (result, set_result) = signal(0);
 
     view! {
         <h3>Custom arguments to the <code>#[server]</code> " macro"</h3>
-        <p>
-            This example shows how to specify additional behavior including
-            <ul>
-                <li>Specific server function <strong>paths</strong></li>
-                <li>Mixing and matching input and output <strong>encodings</strong></li>
-                <li>Adding custom <strong>middleware</strong> on a per-server-fn basis</li>
-            </ul>
-        </p>
-        <input node_ref=input_ref placeholder="Type something here."/>
-        <button
-            on:click=move |_| {
-                let value = input_ref.get().unwrap().value();
-                spawn_local(async move {
-                    let length = length_of_input(value).await.unwrap_or(0);
-                    set_result(length);
-                });
-            }
-        >
+        <p>This example shows how to specify additional behavior, including:</p>
+        <ul>
+            <li>Specific server function <strong>paths</strong></li>
+            <li>Mixing and matching input and output <strong>encodings</strong></li>
+            <li>Adding custom <strong>middleware</strong>on a per-server-fn basis</li>
+        </ul>
+        <input node_ref=input_ref placeholder="Type something here." />
+        <button on:click=move |_| {
+            let value = input_ref.get().unwrap().value();
+            spawn_local(async move {
+                let length = length_of_input(value).await.unwrap_or(0);
+                set_result.set(length);
+            });
+        }>
+
             Click to see length
         </button>
         <p>Length is {result}</p>
@@ -306,26 +314,21 @@ pub async fn rkyv_example(input: String) -> Result<String, ServerFnError> {
 #[component]
 pub fn RkyvExample() -> impl IntoView {
     let input_ref = NodeRef::<Input>::new();
-    let (input, set_input) = create_signal(String::new());
-    let rkyv_result = create_resource(input, rkyv_example);
+    let (input, set_input) = signal(String::new());
+    let rkyv_result = Resource::new(move || input.get(), rkyv_example);
 
     view! {
-        <h3>Using <code>rkyv</code> encoding</h3>
-        <p>
-        </p>
-        <input node_ref=input_ref placeholder="Type something here."/>
-        <button
-            on:click=move |_| {
-                let value = input_ref.get().unwrap().value();
-                set_input(value);
-            }
-        >
+        <h3>Using <code>rkyv</code>encoding</h3>
+        <input node_ref=input_ref placeholder="Type something here." />
+        <button on:click=move |_| {
+            let value = input_ref.get().unwrap().value();
+            set_input.set(value);
+        }>
+
             Click to capitalize
         </button>
         <p>{input}</p>
-        <Transition>
-            {rkyv_result}
-        </Transition>
+        <Transition>{rkyv_result}</Transition>
     }
 }
 
@@ -362,10 +365,9 @@ pub fn FileUpload() -> impl IntoView {
         Ok(count)
     }
 
-    let upload_action = create_action(|data: &FormData| {
-        let data = data.clone();
+    let upload_action = Action::new_local(|data: &FormData| {
         // `MultipartData` implements `From<FormData>`
-        file_length(data.into())
+        file_length(data.clone().into())
     });
 
     view! {
@@ -375,21 +377,25 @@ pub fn FileUpload() -> impl IntoView {
             ev.prevent_default();
             let target = ev.target().unwrap().unchecked_into::<HtmlFormElement>();
             let form_data = FormData::new_with_form(&target).unwrap();
-            upload_action.dispatch(form_data);
+            upload_action.dispatch_local(form_data);
         }>
-            <input type="file" name="file_to_upload"/>
-            <input type="submit"/>
+            <input type="file" name="file_to_upload" />
+            <input type="submit" />
         </form>
         <p>
-            {move || if upload_action.input().get().is_none() && upload_action.value().get().is_none() {
-                "Upload a file.".to_string()
-            } else if upload_action.pending().get() {
-                "Uploading...".to_string()
-            } else if let Some(Ok(value)) = upload_action.value().get() {
-                value.to_string()
-            } else {
-                format!("{:?}", upload_action.value().get())
+            {move || {
+                if upload_action.input().read().is_none() && upload_action.value().read().is_none()
+                {
+                    "Upload a file.".to_string()
+                } else if upload_action.pending().get() {
+                    "Uploading...".to_string()
+                } else if let Some(Ok(value)) = upload_action.value().get() {
+                    value.to_string()
+                } else {
+                    format!("{:?}", upload_action.value().get())
+                }
             }}
+
         </p>
     }
 }
@@ -413,13 +419,14 @@ pub fn FileUploadWithProgress() -> impl IntoView {
     /// This requires us to store some global state of all the uploads. In a real app, you probably
     /// shouldn't do exactly what I'm doing here in the demo. For example, this map just
     /// distinguishes between files by filename, not by user.
-
     #[cfg(feature = "ssr")]
     mod progress {
         use async_broadcast::{broadcast, Receiver, Sender};
-        use dashmap::DashMap;
         use futures::Stream;
-        use once_cell::sync::Lazy;
+        use std::{
+            collections::HashMap,
+            sync::{LazyLock, RwLock},
+        };
 
         struct File {
             total: usize,
@@ -427,22 +434,31 @@ pub fn FileUploadWithProgress() -> impl IntoView {
             rx: Receiver<usize>,
         }
 
-        static FILES: Lazy<DashMap<String, File>> = Lazy::new(DashMap::new);
+        static FILES: LazyLock<RwLock<HashMap<String, File>>> =
+            LazyLock::new(|| RwLock::new(HashMap::new()));
 
         pub async fn add_chunk(filename: &str, len: usize) {
             println!("[{filename}]\tadding {len}");
-            let mut entry =
-                FILES.entry(filename.to_string()).or_insert_with(|| {
-                    println!("[{filename}]\tinserting channel");
-                    let (tx, rx) = broadcast(128);
-                    File { total: 0, tx, rx }
-                });
-            entry.total += len;
-            let new_total = entry.total;
+            let (tx, new_total) = {
+                let mut lock = FILES.write().unwrap();
+                let entry =
+                    lock.entry(filename.to_string()).or_insert_with(|| {
+                        println!("[{filename}]\tinserting channel");
+                        // NOTE: this channel capacity is set arbitrarily for this demo code.
+                        // it allows for up to exactly 1048 chunks to be sent, which sets an upper cap
+                        // on upload size (the precise details vary by client)
+                        // in a real system, you will want to create some more reasonable ways of
+                        // sending and sharing notifications
+                        //
+                        // see https://github.com/leptos-rs/leptos/issues/4397 for related discussion
+                        let (tx, rx) = broadcast(1048);
+                        File { total: 0, tx, rx }
+                    });
+                entry.total += len;
+                let new_total = entry.total;
 
-            // we're about to do an async broadcast, so we don't want to hold a lock across it
-            let tx = entry.tx.clone();
-            drop(entry);
+                (entry.tx.clone(), new_total)
+            };
 
             // now we send the message and don't have to worry about it
             tx.broadcast(new_total)
@@ -451,12 +467,12 @@ pub fn FileUploadWithProgress() -> impl IntoView {
         }
 
         pub fn for_file(filename: &str) -> impl Stream<Item = usize> {
-            let entry =
-                FILES.entry(filename.to_string()).or_insert_with(|| {
-                    println!("[{filename}]\tinserting channel");
-                    let (tx, rx) = broadcast(128);
-                    File { total: 0, tx, rx }
-                });
+            let mut lock = FILES.write().unwrap();
+            let entry = lock.entry(filename.to_string()).or_insert_with(|| {
+                println!("[{filename}]\tinserting channel");
+                let (tx, rx) = broadcast(128);
+                File { total: 0, tx, rx }
+            });
             entry.rx.clone()
         }
     }
@@ -495,9 +511,9 @@ pub fn FileUploadWithProgress() -> impl IntoView {
         Ok(TextStream::new(progress))
     }
 
-    let (filename, set_filename) = create_signal(None);
-    let (max, set_max) = create_signal(None);
-    let (current, set_current) = create_signal(None);
+    let (filename, set_filename) = signal(None);
+    let (max, set_max) = signal(None);
+    let (current, set_current) = signal(None);
     let on_submit = move |ev: SubmitEvent| {
         ev.prevent_default();
         let target = ev.target().unwrap().unchecked_into::<HtmlFormElement>();
@@ -507,9 +523,9 @@ pub fn FileUploadWithProgress() -> impl IntoView {
             .unchecked_into::<web_sys::File>();
         let filename = file.name();
         let size = file.size() as usize;
-        set_filename(Some(filename.clone()));
-        set_max(Some(size));
-        set_current(None::<usize>);
+        set_filename.set(Some(filename.clone()));
+        set_max.set(Some(size));
+        set_current.set(None);
 
         spawn_local(async move {
             let mut progress = file_progress(filename)
@@ -525,14 +541,14 @@ pub fn FileUploadWithProgress() -> impl IntoView {
                 let len = len
                     .split('\n')
                     .filter(|n| !n.is_empty())
-                    .last()
+                    .next_back()
                     .expect(
                         "expected at least one non-empty value from \
                          newline-delimited rows",
                     )
                     .parse::<usize>()
                     .expect("invalid length");
-                set_current(Some(len));
+                set_current.set(Some(len));
             }
         });
         spawn_local(async move {
@@ -547,13 +563,16 @@ pub fn FileUploadWithProgress() -> impl IntoView {
         <p>A file upload with progress can be handled with two separate server functions.</p>
         <aside>See the doc comment on the component for an explanation.</aside>
         <form on:submit=on_submit>
-            <input type="file" name="file_to_upload"/>
-            <input type="submit"/>
+            <input type="file" name="file_to_upload" />
+            <input type="submit" />
         </form>
-        {move || filename().map(|filename| view! { <p>Uploading {filename}</p> })}
-        {move || max().map(|max| view! {
-            <progress max=max value=move || current().unwrap_or_default()/>
-        })}
+        {move || filename.get().map(|filename| view! { <p>Uploading {filename}</p> })}
+        <ShowLet some=max let:max>
+            <progress
+                max=max
+                value=move || current.get().unwrap_or_default()
+            ></progress>
+        </ShowLet>
     }
 }
 #[component]
@@ -590,9 +609,9 @@ pub fn FileWatcher() -> impl IntoView {
         Ok(TextStream::from(rx))
     }
 
-    let (files, set_files) = create_signal(Vec::new());
+    let (files, set_files) = signal(Vec::new());
 
-    create_effect(move |_| {
+    Effect::new(move |_| {
         spawn_local(async move {
             while let Some(res) =
                 watched_files().await.unwrap().into_inner().next().await
@@ -608,9 +627,27 @@ pub fn FileWatcher() -> impl IntoView {
         <h3>Watching files and returning a streaming response</h3>
         <p>Files changed since you loaded the page:</p>
         <ul>
-            {move || files.get().into_iter().map(|file| view! { <li><code>{file}</code></li> }).collect::<Vec<_>>()}
+            {move || {
+                files
+                    .get()
+                    .into_iter()
+                    .map(|file| {
+                        view! {
+                            <li>
+                                <code>{file}</code>
+                            </li>
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            }}
+
         </ul>
-        <p><em>Add or remove some text files in the <code>watched_files</code> directory and see the list of changes here.</em></p>
+        <p>
+            <em>
+                Add or remove some text files in the <code>watched_files</code>
+                directory and see the list of changes here.
+            </em>
+        </p>
     }
 }
 
@@ -623,32 +660,95 @@ pub fn FileWatcher() -> impl IntoView {
 /// implementations if you'd like. However, it's much lighter weight to use something like `strum`
 /// simply to generate those trait implementations.
 #[server]
-pub async fn ascii_uppercase(
-    text: String,
-) -> Result<String, ServerFnError<InvalidArgument>> {
+pub async fn ascii_uppercase(text: String) -> Result<String, MyErrors> {
+    other_error()?;
+    Ok(ascii_uppercase_inner(text)?)
+}
+
+pub fn other_error() -> Result<(), String> {
+    Ok(())
+}
+
+pub fn ascii_uppercase_inner(text: String) -> Result<String, InvalidArgument> {
     if text.len() < 5 {
-        Err(InvalidArgument::TooShort.into())
+        Err(InvalidArgument::TooShort)
     } else if text.len() > 15 {
-        Err(InvalidArgument::TooLong.into())
+        Err(InvalidArgument::TooLong)
     } else if text.is_ascii() {
         Ok(text.to_ascii_uppercase())
     } else {
-        Err(InvalidArgument::NotAscii.into())
+        Err(InvalidArgument::NotAscii)
     }
 }
 
+#[server]
+pub async fn ascii_uppercase_classic(
+    text: String,
+) -> Result<String, ServerFnError<InvalidArgument>> {
+    Ok(ascii_uppercase_inner(text)?)
+}
+
 // The EnumString and Display derive macros are provided by strum
-#[derive(Debug, Clone, EnumString, Display)]
+#[derive(
+    thiserror::Error,
+    Debug,
+    Clone,
+    Display,
+    EnumString,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum InvalidArgument {
     TooShort,
     TooLong,
     NotAscii,
 }
 
+#[derive(
+    thiserror::Error,
+    Debug,
+    Clone,
+    Display,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+pub enum MyErrors {
+    InvalidArgument(InvalidArgument),
+    ServerFnError(ServerFnErrorErr),
+    Other(String),
+}
+
+impl From<InvalidArgument> for MyErrors {
+    fn from(value: InvalidArgument) -> Self {
+        MyErrors::InvalidArgument(value)
+    }
+}
+
+impl From<String> for MyErrors {
+    fn from(value: String) -> Self {
+        MyErrors::Other(value)
+    }
+}
+
+impl FromServerFnError for MyErrors {
+    type Encoder = RkyvEncoding;
+
+    fn from_server_fn_error(value: ServerFnErrorErr) -> Self {
+        MyErrors::ServerFnError(value)
+    }
+}
+
 #[component]
 pub fn CustomErrorTypes() -> impl IntoView {
     let input_ref = NodeRef::<Input>::new();
-    let (result, set_result) = create_signal(None);
+    let (result, set_result) = signal(None);
+    let (result_classic, set_result_classic) = signal(None);
 
     view! {
         <h3>Using custom error types</h3>
@@ -659,21 +759,21 @@ pub fn CustomErrorTypes() -> impl IntoView {
             "Try typing a message that is between 5 and 15 characters of ASCII text below. Then try breaking \
             the rules!"
         </p>
-        <input node_ref=input_ref placeholder="Type something here."/>
-        <button
-            on:click=move |_| {
-                let value = input_ref.get().unwrap().value();
-                spawn_local(async move {
-                    let data = ascii_uppercase(value).await;
-                    set_result(Some(data));
-                });
-            }
-        >
+        <input node_ref=input_ref placeholder="Type something here." />
+        <button on:click=move |_| {
+            let value = input_ref.get().unwrap().value();
+            spawn_local(async move {
+                let data = ascii_uppercase(value.clone()).await;
+                let data_classic = ascii_uppercase_classic(value).await;
+                set_result.set(Some(data));
+                set_result_classic.set(Some(data_classic));
+            });
+        }>
+
             "Submit"
         </button>
-        <p>
-            {move || format!("{:?}", result.get())}
-        </p>
+        <p>{move || format!("{:?}", result.get())}</p>
+        <p>{move || format!("{:?}", result_classic.get())}</p>
     }
 }
 
@@ -691,8 +791,15 @@ pub struct Toml;
 #[derive(Serialize, Deserialize)]
 pub struct TomlEncoded<T>(T);
 
-impl Encoding for Toml {
+impl ContentType for Toml {
     const CONTENT_TYPE: &'static str = "application/toml";
+}
+
+impl FormatType for Toml {
+    const FORMAT_TYPE: Format = Format::Text;
+}
+
+impl Encoding for Toml {
     const METHOD: Method = Method::POST;
 }
 
@@ -700,14 +807,12 @@ impl<T, Request, Err> IntoReq<Toml, Request, Err> for TomlEncoded<T>
 where
     Request: ClientReq<Err>,
     T: Serialize,
+    Err: FromServerFnError,
 {
-    fn into_req(
-        self,
-        path: &str,
-        accepts: &str,
-    ) -> Result<Request, ServerFnError<Err>> {
-        let data = toml::to_string(&self.0)
-            .map_err(|e| ServerFnError::Serialization(e.to_string()))?;
+    fn into_req(self, path: &str, accepts: &str) -> Result<Request, Err> {
+        let data = toml::to_string(&self.0).map_err(|e| {
+            ServerFnErrorErr::Serialization(e.to_string()).into_app_error()
+        })?;
         Request::try_new_post(path, Toml::CONTENT_TYPE, accepts, data)
     }
 }
@@ -716,23 +821,26 @@ impl<T, Request, Err> FromReq<Toml, Request, Err> for TomlEncoded<T>
 where
     Request: Req<Err> + Send,
     T: DeserializeOwned,
+    Err: FromServerFnError,
 {
-    async fn from_req(req: Request) -> Result<Self, ServerFnError<Err>> {
+    async fn from_req(req: Request) -> Result<Self, Err> {
         let string_data = req.try_into_string().await?;
         toml::from_str::<T>(&string_data)
             .map(TomlEncoded)
-            .map_err(|e| ServerFnError::Args(e.to_string()))
+            .map_err(|e| ServerFnErrorErr::Args(e.to_string()).into_app_error())
     }
 }
 
 impl<T, Response, Err> IntoRes<Toml, Response, Err> for TomlEncoded<T>
 where
-    Response: Res<Err>,
+    Response: TryRes<Err>,
     T: Serialize + Send,
+    Err: FromServerFnError,
 {
-    async fn into_res(self) -> Result<Response, ServerFnError<Err>> {
-        let data = toml::to_string(&self.0)
-            .map_err(|e| ServerFnError::Serialization(e.to_string()))?;
+    async fn into_res(self) -> Result<Response, Err> {
+        let data = toml::to_string(&self.0).map_err(|e| {
+            ServerFnErrorErr::Serialization(e.to_string()).into_app_error()
+        })?;
         Response::try_from_string(Toml::CONTENT_TYPE, data)
     }
 }
@@ -741,12 +849,13 @@ impl<T, Response, Err> FromRes<Toml, Response, Err> for TomlEncoded<T>
 where
     Response: ClientRes<Err> + Send,
     T: DeserializeOwned,
+    Err: FromServerFnError,
 {
-    async fn from_res(res: Response) -> Result<Self, ServerFnError<Err>> {
+    async fn from_res(res: Response) -> Result<Self, Err> {
         let data = res.try_into_string().await?;
-        toml::from_str(&data)
-            .map(TomlEncoded)
-            .map_err(|e| ServerFnError::Deserialization(e.to_string()))
+        toml::from_str(&data).map(TomlEncoded).map_err(|e| {
+            ServerFnErrorErr::Deserialization(e.to_string()).into_app_error()
+        })
     }
 }
 
@@ -776,23 +885,22 @@ pub async fn why_not(
 #[component]
 pub fn CustomEncoding() -> impl IntoView {
     let input_ref = NodeRef::<Input>::new();
-    let (result, set_result) = create_signal("foo".to_string());
+    let (result, set_result) = signal("foo".to_string());
 
     view! {
         <h3>Custom encodings</h3>
         <p>
             "This example creates a custom encoding that sends server fn data using TOML. Why? Well... why not?"
         </p>
-        <input node_ref=input_ref placeholder="Type something here."/>
-        <button
-            on:click=move |_| {
-                let value = input_ref.get().unwrap().value();
-                spawn_local(async move {
+        <input node_ref=input_ref placeholder="Type something here." />
+        <button on:click=move |_| {
+            let value = input_ref.get().unwrap().value();
+            spawn_local(async move {
                 let new_value = why_not(value, ", but in TOML!!!".to_string()).await.unwrap();
-                    set_result(new_value.0.modified);
-                });
-            }
-        >
+                set_result.set(new_value.0.modified);
+            });
+        }>
+
             Submit
         </button>
         <p>{result}</p>
@@ -810,7 +918,12 @@ pub fn CustomClientExample() -> impl IntoView {
     pub struct CustomClient;
 
     // Implement the `Client` trait for it.
-    impl<CustErr> Client<CustErr> for CustomClient {
+    impl<E, IS, OS> Client<E, IS, OS> for CustomClient
+    where
+        E: FromServerFnError,
+        IS: FromServerFnError,
+        OS: FromServerFnError,
+    {
         // BrowserRequest and BrowserResponse are the defaults used by other server functions.
         // They are wrappers for the underlying Web Fetch API types.
         type Request = BrowserRequest;
@@ -819,15 +932,35 @@ pub fn CustomClientExample() -> impl IntoView {
         // Our custom `send()` implementation does all the work.
         fn send(
             req: Self::Request,
-        ) -> impl Future<Output = Result<Self::Response, ServerFnError<CustErr>>>
-               + Send {
+        ) -> impl Future<Output = Result<Self::Response, E>> + Send {
             // BrowserRequest derefs to the underlying Request type from gloo-net,
             // so we can get access to the headers here
             let headers = req.headers();
             // modify the headers by appending one
             headers.append("X-Custom-Header", "foobar");
             // delegate back out to BrowserClient to send the modified request
-            BrowserClient::send(req)
+            <BrowserClient as Client<E, IS, OS>>::send(req)
+        }
+
+        fn open_websocket(
+            path: &str,
+        ) -> impl Future<
+            Output = Result<
+                (
+                    impl Stream<
+                            Item = Result<server_fn::Bytes, server_fn::Bytes>,
+                        > + Send
+                        + 'static,
+                    impl Sink<server_fn::Bytes> + Send + 'static,
+                ),
+                E,
+            >,
+        > + Send {
+            <BrowserClient as Client<E, IS, OS>>::open_websocket(path)
+        }
+
+        fn spawn(future: impl Future<Output = ()> + Send + 'static) {
+            <BrowserClient as Client<E, IS, OS>>::spawn(future)
         }
     }
 
@@ -845,8 +978,76 @@ pub fn CustomClientExample() -> impl IntoView {
 
     view! {
         <h3>Custom clients</h3>
-        <p>You can define a custom server function client to do something like adding a header to every request.</p>
-        <p>Check the network request in your browser devtools to see how this client adds a custom header.</p>
-        <button on:click=|_| spawn_local(async { fn_with_custom_client().await.unwrap() })>Click me</button>
+        <p>
+            You can define a custom server function client to do something like adding a header to every request.
+        </p>
+        <p>
+            Check the network request in your browser devtools to see how this client adds a custom header.
+        </p>
+        <button on:click=|_| spawn_local(async {
+            fn_with_custom_client().await.unwrap()
+        })>Click me</button>
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PostcardData {
+    name: String,
+    age: u32,
+    hobbies: Vec<String>,
+}
+
+/// This server function uses Postcard for both input and output encoding.
+/// Postcard provides efficient binary serialization, almost as fast as rkyv, while also being
+/// serde compatible
+#[server(input = Postcard, output = Postcard)]
+pub async fn postcard_example(
+    data: PostcardData,
+) -> Result<PostcardData, ServerFnError> {
+    // Simulate some processing time
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    // Modify the data to demonstrate server-side changes
+    let mut modified_data = data.clone();
+    modified_data.age += 1;
+    modified_data.hobbies.push("Rust programming".to_string());
+
+    Ok(modified_data)
+}
+
+/// This component demonstrates the usage of Postcard encoding with server functions.
+/// It allows incrementing the age of a person and shows how the data is
+/// serialized, sent to the server, processed, and returned.
+#[component]
+pub fn PostcardExample() -> impl IntoView {
+    // Initialize the input data
+    let (input, set_input) = signal(PostcardData {
+        name: "Alice".to_string(),
+        age: 30,
+        hobbies: vec!["reading".to_string(), "hiking".to_string()],
+    });
+
+    // Create a resource that will call the server function whenever the input changes
+    let postcard_result = Resource::new(
+        move || input.get(),
+        |data| async move { postcard_example(data).await },
+    );
+
+    view! {
+        <h3>Using <code>postcard</code>encoding</h3>
+        <p>"This example demonstrates using Postcard for efficient binary serialization."</p>
+        <button on:click=move |_| {
+            set_input
+                .update(|data| {
+                    data.age += 1;
+                });
+        }>"Increment Age"</button>
+        // Display the current input data
+        <p>"Input: " {move || format!("{:?}", input.get())}</p>
+        <Transition>
+            // Display the result from the server, which will update automatically
+            // when the input changes due to the resource
+            <p>"Result: " {move || postcard_result.get().map(|r| format!("{:?}", r))}</p>
+        </Transition>
     }
 }

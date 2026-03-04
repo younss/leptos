@@ -77,6 +77,42 @@ pub async fn second_button(client: &Client) -> Result<Element> {
     Ok(counter_button)
 }
 
+pub async fn instrumented_count(
+    client: &Client,
+    selector: &str,
+) -> Result<u32> {
+    let element = client
+        .wait()
+        .for_element(Locator::Id(selector))
+        .await
+        .expect(format!("Element #{selector} not found.").as_str());
+    let text = element.text().await?;
+    let count = text.parse::<u32>().expect(
+        format!("Element #{selector} does not contain a number.").as_str(),
+    );
+    Ok(count)
+}
+
+pub async fn reset_counter(client: &Client) -> Result<Element> {
+    let reset_button = client
+        .wait()
+        .for_element(Locator::Id("reset-counters"))
+        .await
+        .expect("Reset counter input not found");
+
+    Ok(reset_button)
+}
+
+pub async fn reset_csr_counter(client: &Client) -> Result<Element> {
+    let reset_button = client
+        .wait()
+        .for_element(Locator::Id("reset-csr-counters"))
+        .await
+        .expect("Reset CSR counter input not found");
+
+    Ok(reset_button)
+}
+
 async fn component_message(client: &Client, id: &str) -> Result<String> {
     let element =
         client.wait().for_element(Locator::Id(id)).await.expect(
@@ -86,4 +122,13 @@ async fn component_message(client: &Client, id: &str) -> Result<String> {
     let text = element.text().await?;
 
     Ok(text)
+}
+
+pub async fn link_with_text(client: &Client, text: &str) -> Result<Element> {
+    let link = client
+        .wait()
+        .for_element(Locator::LinkText(text))
+        .await
+        .expect(format!("Link not found by `{}`", text).as_str());
+    Ok(link)
 }

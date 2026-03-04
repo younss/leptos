@@ -4,15 +4,15 @@ use wasm_bindgen::UnwrapThrowExt;
 /// Use for tracing property
 macro_rules! tracing_props {
     () => {
-        ::leptos::leptos_dom::tracing::span!(
-            ::leptos::leptos_dom::tracing::Level::TRACE,
+        ::leptos::tracing::span!(
+            ::leptos::tracing::Level::TRACE,
             "leptos_dom::tracing_props",
             props = String::from("[]")
         );
     };
     ($($prop:tt),+ $(,)?) => {
         {
-            use ::leptos::leptos_dom::tracing_property::{Match, SerializeMatch, DefaultMatch};
+            use ::leptos::leptos_dom::macro_helpers::tracing_property::{Match, SerializeMatch, DefaultMatch};
             let mut props = String::from('[');
             $(
                 let prop = (&&Match {
@@ -23,8 +23,8 @@ macro_rules! tracing_props {
             )*
             props.pop();
             props.push(']');
-            ::leptos::leptos_dom::tracing::span!(
-                ::leptos::leptos_dom::tracing::Level::TRACE,
+            ::leptos::tracing::span!(
+                ::leptos::tracing::Level::TRACE,
                 "leptos_dom::tracing_props",
                 props
             );
@@ -51,18 +51,12 @@ impl<T: serde::Serialize> SerializeMatch for &Match<&T> {
 
         // suppresses warnings when serializing signals into props
         #[cfg(debug_assertions)]
-        let prev = leptos_reactive::SpecialNonReactiveZone::enter();
+        let _z = reactive_graph::diagnostics::SpecialNonReactiveZone::enter();
 
-        let value = serde_json::to_string(self.value.get().unwrap_throw())
-            .map_or_else(
-                |err| format!(r#"{{"name": "{name}", "error": "{err}"}}"#),
-                |value| format!(r#"{{"name": "{name}", "value": {value}}}"#),
-            );
-
-        #[cfg(debug_assertions)]
-        leptos_reactive::SpecialNonReactiveZone::exit(prev);
-
-        value
+        serde_json::to_string(self.value.get().unwrap_throw()).map_or_else(
+            |err| format!(r#"{{"name": "{name}", "error": "{err}"}}"#),
+            |value| format!(r#"{{"name": "{name}", "value": {value}}}"#),
+        )
     }
 }
 
@@ -155,9 +149,8 @@ fn match_serialize() {
 }
 
 #[test]
+#[allow(clippy::needless_borrow)]
 fn match_no_serialize() {
-    #![allow(clippy::needless_borrow)]
-
     struct CustomStruct {
         field: &'static str,
     }
